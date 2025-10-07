@@ -309,7 +309,7 @@ if __name__ == "__main__":
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["32813", "market-pulse-25q4, "minibench", "both"], default="both")
+    parser.add_argument("--mode", choices=["32813", "market-pulse-25q4", "minibench", "both"], default="32813", "market-pulse-25q4", "minibench")
     args = parser.parse_args()
 
     bot = ConfidenceWeightedEnsembleBot2025(
@@ -336,7 +336,7 @@ if __name__ == "__main__":
 
     async def run():
         reports = []
-        if args.mode in ("32813", "both"):
+        if args.mode in ("32813", "market-pulse-25q4", "minibench"):
             r1 = await bot.forecast_on_tournament(32813, return_exceptions=True)
             reports.extend(r1)
         if args.mode in ("minibench", "both"):
