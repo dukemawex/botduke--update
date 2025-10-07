@@ -57,7 +57,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
     async def run_research(self, question: MetaculusQuestion) -> str:
         self._current_question = question
         async with self._concurrency_limiter:
-            researcher = self.get_llm("researcher")
+            researcher = self.get_llm("researcher", "llm")  # Explicitly request LLM object
             prompt = clean_indents(
                 f"""
                 You are an assistant to a superforecaster.
@@ -79,10 +79,12 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             logger.info(f"Research for {question.page_url}:\n{research}")
             return research
 
-    def get_llm(self, role: str, return_type: str = "model_name") -> Any:
+    # Correct signature: matches parent class
+    def get_llm(self, role: str, guarantee_type: Literal["llm", "model_name"] = "llm") -> Any:
         if role == "default":
             raise RuntimeError("Do not call get_llm('default') directly in this bot.")
-        return super().get_llm(role, return_type)
+        # Delegate all other roles (researcher, parser, etc.) to parent
+        return super().get_llm(role, guarantee_type)
 
     async def _run_forecast_with_confidence(
         self, question: MetaculusQuestion, research: str, model_key: str
@@ -310,7 +312,7 @@ if __name__ == "__main__":
 
     bot = ConfidenceWeightedEnsembleBot2025(
         research_reports_per_question=1,
-        predictions_per_research_report=1,
+        predictions_per_research_report=1,  # Ensemble handled internally
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
