@@ -244,12 +244,10 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             options = question.options
             weighted_probs = np.zeros(len(options))
             total_weight = 0.0
-            valid_count = 0
             for pred, weight, model_key in results:
                 if not isinstance(pred.prediction_value, PredictedOptionList):
                     logger.warning(f"Model {model_key} returned non-MCQ prediction: {type(pred.prediction_value)}")
                     continue
-                valid_count += 1
                 total_weight += weight
                 for i, opt in enumerate(options):
                     try:
@@ -257,7 +255,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                         weighted_probs[i] += prob * weight
                     except Exception as e:
                         logger.warning(f"Error getting prob for {opt} from model {model_key}: {e}")
-                        weighted_probs[i] += (1.0 / len(options)) * weight  # uniform fallback
+                        weighted_probs[i] += (1.0 / len(options)) * weight
             if total_weight > 0:
                 weighted_probs /= total_weight
             else:
@@ -277,10 +275,10 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                         logger.warning(f"Model {model_key} returned non-numeric prediction: {type(pred.prediction_value)}")
                         continue
                     dist: NumericDistribution = pred.prediction_value
-                    # SAFEGUARD: Use declared_percentiles (no get_percentile_value)
                     val = None
                     for perc in dist.declared_percentiles:
-                        if perc.percentile == p:
+                        # Compare as fraction (e.g., 0.1 == 10th percentile)
+                        if abs(perc.percentile - p / 100.0) < 1e-6:
                             val = perc.value
                             break
                     if val is not None:
@@ -288,13 +286,13 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                         weights_list.append(weight)
                 if vals:
                     med_val = self._weighted_median(vals, weights_list)
-                    median_percentiles.append(Percentile(percentile=p, value=med_val))
+                    # ✅ CRITICAL: percentile must be in [0, 1]
+                    median_percentiles.append(Percentile(percentile=p / 100.0, value=med_val))
                 else:
-                    # Fallback: use question bounds or 0
-                    fallback = 0.0
-                    if not question.open_lower_bound and question.lower_bound is not None:
-                        fallback = float(question.lower_bound)
-                    median_percentiles.append(Percentile(percentile=p, value=fallback))
+                    fallback_val = 0.0
+                    if question.lower_bound is not None and not question.open_lower_bound:
+                        fallback_val = float(question.lower_bound)
+                    median_percentiles.append(Percentile(percentile=p / 100.0, value=fallback_val))
             final_dist = NumericDistribution.from_question(median_percentiles, question)
             combined_reasoning = "\n\n".join(f"[{r[2]}] {r[0].reasoning}" for r in results)
             return ReasonedPrediction(prediction_value=final_dist, reasoning=combined_reasoning)
