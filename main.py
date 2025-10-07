@@ -215,26 +215,53 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         results = []
 
         for model_key in self.FORECAST_MODELS:
-            pred, conf = await self._run_forecast_with_confidence(question, research, model_key)
-            effective_weight = weights[model_key] * conf
-            results.append((pred, effective_weight, model_key))
-            logger.info(f"Model {model_key}: confidence={conf:.2f}, weight={effective_weight:.2f}")
+            try:
+                pred, conf = await self._run_forecast_with_confidence(question, research, model_key)
+                effective_weight = weights[model_key] * conf
+                results.append((pred, effective_weight, model_key))
+                logger.info(f"Model {model_key}: confidence={conf:.2f}, weight={effective_weight:.2f}")
+            except Exception as e:
+                logger.warning(f"Model {model_key} failed on question {question.page_url}: {e}")
+                continue
+
+        if not results:
+            raise RuntimeError("All forecast models failed.")
 
         if isinstance(question, BinaryQuestion):
-            values = [r[0].prediction_value for r in results]
-            weighted_median_val = self._weighted_median(values, [r[1] for r in results])
+            values = []
+            for r in results:
+                if isinstance(r[0].prediction_value, (int, float)):
+                    values.append(float(r[0].prediction_value))
+                else:
+                    logger.warning(f"Unexpected prediction type for binary: {type(r[0].prediction_value)}")
+            if not values:
+                raise TypeError("No valid binary predictions collected.")
+            weighted_median_val = self._weighted_median(values, [r[1] for r in results[:len(values)]])
             combined_reasoning = "\n\n".join(f"[{r[2]}] {r[0].reasoning}" for r in results)
             return ReasonedPrediction(prediction_value=weighted_median_val, reasoning=combined_reasoning)
 
         elif isinstance(question, MultipleChoiceQuestion):
             options = question.options
             weighted_probs = np.zeros(len(options))
-            total_weight = sum(r[1] for r in results)
-            for pred, weight, _ in results:
+            total_weight = 0.0
+            valid_count = 0
+            for pred, weight, model_key in results:
+                if not isinstance(pred.prediction_value, PredictedOptionList):
+                    logger.warning(f"Model {model_key} returned non-MCQ prediction: {type(pred.prediction_value)}")
+                    continue
+                valid_count += 1
+                total_weight += weight
                 for i, opt in enumerate(options):
-                    weighted_probs[i] += pred.get_probability_for_option(opt) * weight
+                    try:
+                        prob = pred.prediction_value.get_probability_for_option(opt)
+                        weighted_probs[i] += prob * weight
+                    except Exception as e:
+                        logger.warning(f"Error getting prob for {opt} from model {model_key}: {e}")
+                        weighted_probs[i] += (1.0 / len(options)) * weight  # uniform fallback
             if total_weight > 0:
                 weighted_probs /= total_weight
+            else:
+                weighted_probs = np.full(len(options), 1.0 / len(options))
             final_pred = PredictedOptionList.from_option_probabilities(options, weighted_probs.tolist())
             combined_reasoning = "\n\n".join(f"[{r[2]}] {r[0].reasoning}" for r in results)
             return ReasonedPrediction(prediction_value=final_pred, reasoning=combined_reasoning)
@@ -245,10 +272,17 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             for p in target_percentiles:
                 vals = []
                 weights_list = []
-                for pred, weight, _ in results:
+                for pred, weight, model_key in results:
+                    if not isinstance(pred.prediction_value, NumericDistribution):
+                        logger.warning(f"Model {model_key} returned non-numeric prediction: {type(pred.prediction_value)}")
+                        continue
                     dist: NumericDistribution = pred.prediction_value
-                    # FIX: Use declared_percentiles instead of non-existent method
-                    val = next((perc.value for perc in dist.declared_percentiles if perc.percentile == p), None)
+                    # SAFEGUARD: Use declared_percentiles (no get_percentile_value)
+                    val = None
+                    for perc in dist.declared_percentiles:
+                        if perc.percentile == p:
+                            val = perc.value
+                            break
                     if val is not None:
                         vals.append(val)
                         weights_list.append(weight)
@@ -256,18 +290,24 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                     med_val = self._weighted_median(vals, weights_list)
                     median_percentiles.append(Percentile(percentile=p, value=med_val))
                 else:
-                    median_percentiles.append(Percentile(percentile=p, value=0))
+                    # Fallback: use question bounds or 0
+                    fallback = 0.0
+                    if not question.open_lower_bound and question.lower_bound is not None:
+                        fallback = float(question.lower_bound)
+                    median_percentiles.append(Percentile(percentile=p, value=fallback))
             final_dist = NumericDistribution.from_question(median_percentiles, question)
             combined_reasoning = "\n\n".join(f"[{r[2]}] {r[0].reasoning}" for r in results)
             return ReasonedPrediction(prediction_value=final_dist, reasoning=combined_reasoning)
 
         else:
-            raise TypeError("Unsupported question type")
+            raise TypeError(f"Unsupported question type: {type(question)}")
 
     def _weighted_median(self, values: List[float], weights: List[float]) -> float:
+        if not values or not weights or len(values) != len(weights):
+            return 0.5
         sorted_pairs = sorted(zip(values, weights), key=lambda x: x[0])
         total_weight = sum(weights)
-        cum_weight = 0
+        cum_weight = 0.0
         for val, w in sorted_pairs:
             cum_weight += w
             if cum_weight >= total_weight / 2:
