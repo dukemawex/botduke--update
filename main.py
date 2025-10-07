@@ -3,7 +3,6 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Literal, List, Any, Dict, Union, Tuple
-from statistics import median
 import numpy as np
 
 from forecasting_tools import (
@@ -118,7 +117,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             )
             reasoning = await llm.invoke(prompt)
             pred: BinaryPrediction = await structure_output(reasoning, BinaryPrediction, model=llm)
-            value = max(0.01, min(0.99, pred.prediction_in_decimal)
+            value = max(0.01, min(0.99, pred.prediction_in_decimal))
             confidence = self._extract_confidence(reasoning)
 
         elif isinstance(question, MultipleChoiceQuestion):
@@ -311,7 +310,7 @@ if __name__ == "__main__":
 
     bot = ConfidenceWeightedEnsembleBot2025(
         research_reports_per_question=1,
-        predictions_per_research_report=1,  # Handled internally via ensemble
+        predictions_per_research_report=1,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
