@@ -33,7 +33,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
     - Forecasters: gpt-5, gpt-4o-mini, claude-sonnet-4.5
     - Confidence-weighted aggregation
     - Dynamic model weighting per question type
-    - Targets tournament 32813 and Minibench separately
+    - Targets tournaments 32813, 32831, and Minibench
     """
 
     _max_concurrent_questions = 1
@@ -45,7 +45,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         "claude-sonnet-4.5": "openrouter/anthropic/claude-sonnet-4.5",
     }
 
-    # Base confidence weights (will be adjusted dynamically)
     BASE_WEIGHTS = {
         "gpt-5": 1.0,
         "gpt-4o-mini": 0.9,
@@ -55,7 +54,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._current_question = None
-        self._model_call_log = []
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         self._current_question = question
@@ -84,15 +82,12 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
 
     def get_llm(self, role: str, return_type: str = "model_name") -> Any:
         if role == "default":
-            # This is called once per forecast attempt
-            # We'll handle model selection in _run_forecast_with_confidence instead
             raise RuntimeError("Do not call get_llm('default') directly in this bot.")
         return super().get_llm(role, return_type)
 
     async def _run_forecast_with_confidence(
         self, question: MetaculusQuestion, research: str, model_key: str
     ) -> Tuple[ReasonedPrediction, float]:
-        """Run forecast with self-assessed confidence (0–1)."""
         model_name = self.FORECAST_MODELS[model_key]
         llm = GeneralLlm(model=model_name, temperature=0.3, timeout=45, allowed_tries=2)
 
@@ -123,7 +118,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             )
             reasoning = await llm.invoke(prompt)
             pred: BinaryPrediction = await structure_output(reasoning, BinaryPrediction, model=llm)
-            value = max(0.01, min(0.99, pred.prediction_in_decimal))
+            value = max(0.01, min(0.99, pred.prediction_in_decimal)
             confidence = self._extract_confidence(reasoning)
 
         elif isinstance(question, MultipleChoiceQuestion):
@@ -181,24 +176,21 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         match = re.search(r"Confidence:\s*([\d.]+)%?", text, re.IGNORECASE)
         if match:
             conf = float(match.group(1)) / 100.0
-            return min(1.0, max(0.1, conf))  # Clamp to [0.1, 1.0]
-        return 0.7  # Default if missing
+            return min(1.0, max(0.1, conf))
+        return 0.7
 
     def _get_dynamic_weights(self, question: MetaculusQuestion) -> Dict[str, float]:
-        """Adjust weights based on question characteristics."""
         weights = self.BASE_WEIGHTS.copy()
-
         q_text = question.question_text.lower()
 
         # Favor Claude for labor/social dynamics (e.g., strikes)
         if any(kw in q_text for kw in ["strike", "labor", "union", "workforce", "social"]):
-            weights["claude-3.5-sonnet"] *= 1.2
+            weights["claude-sonnet-4.5"] *= 1.2
 
         # Favor GPT-5 for long-range tech/existential questions
         if any(kw in q_text for kw in ["extinction", "ai catastrophe", "by 2100", "leading labs"]):
             weights["gpt-5"] *= 1.3
 
-        # Normalize
         total = sum(weights.values())
         return {k: v / total for k, v in weights.items()}
 
@@ -220,7 +212,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
     async def _run_generic_forecast(
         self, question: MetaculusQuestion, research: str
     ) -> ReasonedPrediction:
-        """Runs all 3 models, collects predictions + confidences, returns confidence-weighted median."""
         weights = self._get_dynamic_weights(question)
         results = []
 
@@ -230,7 +221,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             results.append((pred, effective_weight, model_key))
             logger.info(f"Model {model_key}: confidence={conf:.2f}, weight={effective_weight:.2f}")
 
-        # Extract raw values for aggregation
         if isinstance(question, BinaryQuestion):
             values = [r[0].prediction_value for r in results]
             weighted_median_val = self._weighted_median(values, [r[1] for r in results])
@@ -287,17 +277,19 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
     def _create_upper_and_lower_bound_messages(
         self, question: NumericQuestion
     ) -> tuple[str, str]:
-        if question.nominal_upper_bound is not None:
-            ub = question.nominal_upper_bound
-        else:
-            ub = question.upper_bound
-        if question.nominal_lower_bound is not None:
-            lb = question.nominal_lower_bound
-        else:
-            lb = question.lower_bound
+        ub = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
+        lb = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
 
-        upper_msg = f"The outcome can not be higher than {ub}." if not question.open_upper_bound else f"The question creator thinks the number is likely not higher than {ub}."
-        lower_msg = f"The outcome can not be lower than {lb}." if not question.open_lower_bound else f"The question creator thinks the number is likely not lower than {lb}."
+        upper_msg = (
+            f"The outcome can not be higher than {ub}."
+            if not question.open_upper_bound
+            else f"The question creator thinks the number is likely not higher than {ub}."
+        )
+        lower_msg = (
+            f"The outcome can not be lower than {lb}."
+            if not question.open_lower_bound
+            else f"The question creator thinks the number is likely not lower than {lb}."
+        )
         return upper_msg, lower_msg
 
 
@@ -309,12 +301,17 @@ if __name__ == "__main__":
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["32813", "market-pulse-25q4", "minibench", "both"], default="32813", "market-pulse-25q4", "minibench")
+    parser.add_argument(
+        "--mode",
+        choices=["32813", "32831", "minibench", "both"],
+        default="both",
+        help="Tournament to forecast on: 32813 (Market Pulse 25Q4), 32831, minibench, or both"
+    )
     args = parser.parse_args()
 
     bot = ConfidenceWeightedEnsembleBot2025(
         research_reports_per_question=1,
-        predictions_per_research_report=1,  # Handled internally
+        predictions_per_research_report=1,  # Handled internally via ensemble
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
@@ -336,12 +333,15 @@ if __name__ == "__main__":
 
     async def run():
         reports = []
-        if args.mode in ("32813", "market-pulse-25q4", "minibench"):
+        if args.mode in ("32813", "both"):
             r1 = await bot.forecast_on_tournament(32813, return_exceptions=True)
             reports.extend(r1)
-        if args.mode in ("minibench", "both"):
-            r2 = await bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
+        if args.mode in ("32831", "both"):
+            r2 = await bot.forecast_on_tournament(32831, return_exceptions=True)
             reports.extend(r2)
+        if args.mode in ("minibench", "both"):
+            r3 = await bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
+            reports.extend(r3)
         bot.log_report_summary(reports)
 
     asyncio.run(run())
