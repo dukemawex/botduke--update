@@ -228,15 +228,17 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             raise RuntimeError("All forecast models failed.")
 
         if isinstance(question, BinaryQuestion):
-            values = []
-            for r in results:
-                if isinstance(r[0].prediction_value, (int, float)):
-                    values.append(float(r[0].prediction_value))
+            valid_values = []
+            valid_weights = []
+            for pred, weight, model_key in results:
+                if isinstance(pred.prediction_value, (int, float)):
+                    valid_values.append(float(pred.prediction_value))
+                    valid_weights.append(weight)
                 else:
-                    logger.warning(f"Unexpected prediction type for binary: {type(r[0].prediction_value)}")
-            if not values:
+                    logger.warning(f"Unexpected prediction type for binary from {model_key}: {type(pred.prediction_value)}")
+            if not valid_values:
                 raise TypeError("No valid binary predictions collected.")
-            weighted_median_val = self._weighted_median(values, [r[1] for r in results[:len(values)]])
+            weighted_median_val = self._weighted_median(valid_values, valid_weights)
             combined_reasoning = "\n\n".join(f"[{r[2]}] {r[0].reasoning}" for r in results)
             return ReasonedPrediction(prediction_value=weighted_median_val, reasoning=combined_reasoning)
 
@@ -260,7 +262,12 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 weighted_probs /= total_weight
             else:
                 weighted_probs = np.full(len(options), 1.0 / len(options))
-            final_pred = PredictedOptionList.from_option_probabilities(options, weighted_probs.tolist())
+            
+            # ✅ CORRECTED: Instantiate PredictedOptionList directly with option_probabilities dict
+            final_pred = PredictedOptionList(
+                option_probabilities=dict(zip(options, weighted_probs.tolist()))
+            )
+            
             combined_reasoning = "\n\n".join(f"[{r[2]}] {r[0].reasoning}" for r in results)
             return ReasonedPrediction(prediction_value=final_pred, reasoning=combined_reasoning)
 
