@@ -59,12 +59,10 @@ def get_model_id(base_name: str) -> str:
 class ConfidenceWeightedEnsembleBot2025(ForecastBot):
     """
     Financial-Credentialed Ensemble Forecaster
-    - Research: AskNews (breaking financial events) + Tavily (deep context)
-    - Models: gpt-5, gpt-5.1 (calibration), claude-sonnet-4.5 (nuance)
-    - Special handling for stock/financial questions:
-        • Log-normal ensemble for prices
-        • Volatility-scaled confidence
-        • Base-rate anchoring (S&P range, VIX regimes)
+    - Research: AskNews + Tavily
+    - Models: gpt-5, gpt-5.1, claude-sonnet-4.5
+    - Special handling for financial questions
+    - Type-safe parsing with dedicated summarizer & parser LLMs
     """
 
     _max_concurrent_questions = 1
@@ -88,21 +86,43 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         self._asknews_count = 0
         self._query_lock = asyncio.Lock()
 
-        # 🤖 Forecast models (with fallback resolution)
+        # 🤖 Forecast models
         self.FORECAST_MODELS = {
             "gpt-5": "openrouter/openai/gpt-5",
             "gpt-5.1": get_model_id("gpt-5.1"),
             "claude-sonnet-4.5": get_model_id("claude-sonnet-4.5"),
         }
-
-        # 📈 Base weights — gpt-5.1 favored for calibration
         self.BASE_WEIGHTS = {
             "gpt-5": 1.0,
-            "gpt-5.1": 1.3,  # ↑ Higher — expected best calibration
+            "gpt-5.1": 1.3,
             "claude-sonnet-4.5": 1.1,
         }
 
+        # ✅ Dedicated LLMs for roles
+        self.researcher_llm = self.get_llm("researcher", "llm")
+        self.summarizer_llm = self.get_llm("summarizer", "llm")
+        self.parser_llm = self.get_llm("parser", "llm")
+
         self._current_question: Optional[MetaculusQuestion] = None
+
+    # ✅ Override get_llm to ensure roles resolve properly
+    def get_llm(self, role: str, guarantee_type: Literal["llm", "model_name"] = "llm") -> Any:
+        if role in ("default", "researcher", "summarizer", "parser"):
+            # Let parent handle, but ensure fallbacks
+            try:
+                return super().get_llm(role, guarantee_type)
+            except Exception:
+                # Fallback to reasonable defaults
+                fallback_map = {
+                    "researcher": GeneralLlm(model=get_model_id("gpt-5.1"), temperature=0.3, timeout=60),
+                    "summarizer": GeneralLlm(model=get_model_id("gpt-5.1"), temperature=0.2, timeout=45),
+                    "parser": GeneralLlm(model=get_model_id("gpt-5.1"), temperature=0.0, timeout=30),
+                }
+                if role in fallback_map:
+                    logger.warning(f"Using fallback LLM for role '{role}'")
+                    return fallback_map[role]
+                raise
+        return super().get_llm(role, guarantee_type)
 
     async def _increment_query_count(self, source: str) -> bool:
         async with self._query_lock:
@@ -124,8 +144,8 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         ]).lower()
         financial_terms = [
             r"\b(stock|equity|share|s&p|nasdaq|dow|djia|index|ticker|nyse|cpi|fed|interest rate|yield curve|vix|volatility)\b",
-            r"\$[a-z]{1,5}\b",  # e.g., $AAPL
-            r"\b(?:[a-z]{1,4}\.?\s*[ou]n\s+\d{1,2}/\d{1,2})\b",  # e.g., TSLA on 12/15
+            r"\$[a-z]{1,5}\b",
+            r"\b(?:[a-z]{1,4}\.?\s*[ou]n\s+\d{1,2}/\d{1,2})\b",
             r"\bby\s+\d{4}\b.*\b(s&p|nasdaq)",
         ]
         return any(re.search(pat, text) for pat in financial_terms)
@@ -137,21 +157,12 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 q_text = f"{question.question_text} {question.resolution_criteria}"[:250]
                 is_financial = self._is_financial_question(question)
 
-                # Adjust query strategy for financial questions
-                if is_financial:
-                    # Prioritize AskNews for events, earnings, Fed actions
-                    asknews_query = f"Financial market update: {q_text}"
-                    tavily_query = f"Long-term trends and base rates for: {q_text}"
-                else:
-                    asknews_query = tavily_query = q_text
+                asknews_query = f"Financial market update: {q_text}" if is_financial else q_text
+                tavily_query = f"Long-term trends and base rates for: {q_text}" if is_financial else q_text
 
-                # Run in parallel
-                tavily_task = self._run_tavily_research(tavily_query)
-                asknews_task = self._run_asknews_research(asknews_query, financial=is_financial)
+                tavily_res = await self._run_tavily_research(tavily_query)
+                asknews_res = await self._run_asknews_research(asknews_query, financial=is_financial)
 
-                tavily_res, asknews_res = await asyncio.gather(tavily_task, asknews_task)
-
-                # Combine with financial emphasis
                 combined = clean_indents(f"""
                 ### Research Summary (as of {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})
                 {"[FINANCIAL QUESTION]" if is_financial else ""}
@@ -160,9 +171,9 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 {'[Tavily — Deep Context]' + chr(10) + tavily_res if tavily_res else ''}
 
                 ⚠️ Forecaster Guidance:
-                - For financial questions: anchor to base rates (e.g., S&P 52-wk range, historical vol).
-                - Adjust for regime: high VIX → widen intervals; low vol → narrow cautiously.
-                - Never ignore resolution criteria — e.g., "closing price on YYYY-MM-DD".
+                - Anchor to base rates.
+                - High VIX → widen intervals.
+                - Respect resolution criteria strictly.
                 """)
                 return combined
             except Exception as e:
@@ -212,7 +223,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             articles = response.data.articles
             if not articles:
                 return "[No recent news]"
-
             snippets = "\n".join(
                 f"• {a.headline[:70]} ({a.date[:10]}) — {a.snippet[:200]}..."
                 for a in articles[:4]
@@ -225,11 +235,19 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
 
     # ===== QUESTION CATEGORIZATION & WEIGHTING =====
     def _categorize_question(self, q: MetaculusQuestion) -> str:
-        text = (q.question_text + " " + (q.background_info or "")).lower()
-        if any(kw in text for kw in ["probability", "will", "by", "happen", "occur", "?"]):
+        # ✅ FIRST: use actual type — most reliable
+        if isinstance(q, BinaryQuestion):
             return "binary"
-        if any(kw in text for kw in ["which", "who", "what", "option", "among"]):
+        elif isinstance(q, MultipleChoiceQuestion):
             return "mcq"
+        elif isinstance(q, NumericQuestion):
+            return "numeric"
+        # Fallback to heuristics
+        text = (q.question_text + " " + (q.background_info or "")).lower()
+        if "which" in text or "option" in text or hasattr(q, 'options'):
+            return "mcq"
+        if "probability" in text or "will it" in text:
+            return "binary"
         return "numeric"
 
     def _get_dynamic_weights(self, question: MetaculusQuestion) -> Dict[str, float]:
@@ -238,36 +256,114 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         q_type = self._categorize_question(question)
         is_financial = self._is_financial_question(question)
 
-        # Type-based
         if q_type == "binary":
-            weights["gpt-5.1"] *= 1.4  # best calibrated
+            weights["gpt-5.1"] *= 1.4
         elif q_type == "numeric":
             if is_financial:
-                weights["gpt-5"] *= 1.2  # deeper financial reasoning
+                weights["gpt-5"] *= 1.2
                 weights["claude-sonnet-4.5"] *= 1.1
             else:
                 weights["gpt-5"] *= 1.3
         elif q_type == "mcq":
-            weights["claude-sonnet-4.5"] *= 1.3  # contrastive strength
-
-        # Financial boost
+            weights["claude-sonnet-4.5"] *= 1.3
         if is_financial:
-            weights["gpt-5.1"] *= 1.1  # improved quant calibration
+            weights["gpt-5.1"] *= 1.1
 
-        # Normalize
         total = sum(weights.values())
         return {k: v / total for k, v in weights.items()}
 
-    # ===== FORECASTING CORE =====
+    # ===== ROBUST CONFIDENCE EXTRACTION =====
+    def _extract_confidence(self, text: str, is_financial: bool = False) -> float:
+        # Try multiple regex patterns
+        patterns = [
+            r"Confidence:\s*([\d.]+)%?",
+            r"confidence level.*?([\d.]+)%?",
+            r"I am ([\d.]+)%.*confiden",
+            r"self-confidence:\s*([\d.]+)%?",
+            r"(?:certainty|sureness):\s*([\d.]+)%?",
+        ]
+        for pat in patterns:
+            match = re.search(pat, text, re.IGNORECASE)
+            if match:
+                try:
+                    conf = float(match.group(1)) / 100.0
+                    conf = np.clip(conf, 0.3, 1.0)
+                    if is_financial:
+                        conf *= 0.9
+                    return conf
+                except (ValueError, TypeError):
+                    continue
+
+        # Semantic fallback
+        text_lower = text.lower()
+        low_conf_indicators = ["uncertain", "speculative", "hard to say", "guess", "low confidence"]
+        high_conf_indicators = ["certain", "very likely", "clear", "definitive", "high confidence"]
+        
+        if any(word in text_lower for word in low_conf_indicators):
+            return 0.5
+        if any(word in text_lower for word in high_conf_indicators):
+            return 0.85
+        return 0.7  # default
+
+    def _get_bounds(self, q: NumericQuestion) -> Tuple[str, str]:
+        lo = q.nominal_lower_bound if q.nominal_lower_bound is not None else q.lower_bound
+        hi = q.nominal_upper_bound if q.nominal_upper_bound is not None else q.upper_bound
+        lo_str = f"≥{lo}" if q.open_lower_bound else f"={lo} (hard min)"
+        hi_str = f"≤{hi}" if q.open_upper_bound else f"={hi} (hard max)"
+        return lo_str, hi_str
+
+    def _apply_financial_adjustment(self, dist: NumericDistribution, question: NumericQuestion) -> NumericDistribution:
+        try:
+            pcts = {int(p.percentile * 100): p.value for p in dist.declared_percentiles}
+            needed = [10, 20, 40, 50, 60, 80, 90]
+
+            if 50 not in pcts:
+                if 40 in pcts and 60 in pcts:
+                    pcts[50] = (pcts[40] + pcts[60]) / 2
+                else:
+                    pcts[50] = np.median(list(pcts.values()))
+
+            median = pcts[50]
+            if median <= 0:
+                return dist
+
+            log_pcts = {p: np.log(v) for p, v in pcts.items() if v > 0}
+            new_log_pcts = {}
+            for p in needed:
+                if p in log_pcts:
+                    shrink = 0.4 if abs(p - 50) >= 30 else 0.15
+                    new_log = (1 - shrink) * log_pcts[p] + shrink * np.log(median)
+                    new_log_pcts[p] = new_log
+                else:
+                    lower = max([k for k in log_pcts.keys() if k <= p], default=min(log_pcts.keys()))
+                    upper = min([k for k in log_pcts.keys() if k >= p], default=max(log_pcts.keys()))
+                    if lower == upper:
+                        new_log_pcts[p] = log_pcts[lower]
+                    else:
+                        w = (p - lower) / (upper - lower)
+                        new_log_pcts[p] = (1 - w) * log_pcts[lower] + w * log_pcts[upper]
+
+            new_pcts = {p: np.exp(v) for p, v in new_log_pcts.items()}
+            final_percentiles = [
+                Percentile(percentile=p / 100.0, value=new_pcts[p])
+                for p in [10, 20, 40, 60, 80, 90]
+            ]
+            return NumericDistribution.from_question(final_percentiles, question)
+        except Exception as e:
+            logger.warning(f"Financial adjustment failed: {e}")
+            return dist
+
+    # ===== CORE FORECASTING WITH TYPE-SAFE PARSING =====
     async def _run_forecast_with_confidence(
         self, question: MetaculusQuestion, research: str, model_key: str
     ) -> Tuple[ReasonedPrediction, float]:
         model_name = self.FORECAST_MODELS[model_key]
-        llm = GeneralLlm(model=model_name, temperature=0.2, timeout=60, allowed_tries=2)
+        forecaster_llm = GeneralLlm(model=model_name, temperature=0.2, timeout=60, allowed_tries=2)
 
         is_financial = self._is_financial_question(question)
         q_type = self._categorize_question(question)
 
+        # Build prompt
         base_prompt = clean_indents(f"""
         You are a professional superforecaster with finance expertise where relevant.
 
@@ -283,15 +379,15 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         if q_type == "binary":
             prompt = base_prompt + clean_indents(f"""
             Analyze:
-            (a) Time to resolution — short-term (<30d) → higher noise
-            (b) Base rate (e.g., % of similar bills passed, startups succeeded)
-            {"(c) Market-implied probability (if options/futures exist)" if is_financial else ""}
-            (d) Status quo trajectory
+            (a) Time to resolution
+            (b) Base rate
+            {"(c) Market-implied probability" if is_financial else ""}
+            (d) Status quo
 
             Output:
             Rationale: ...
             Probability: ZZ% (0–100)
-            Confidence: WW% (50=guess, 100=certain; ↓ if short-term/financial)
+            Confidence: WW% (50=guess, 100=certain)
             """)
         elif q_type == "mcq":
             options = getattr(question, "options", [])
@@ -299,7 +395,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             Options: {options}
 
             Analyze:
-            (a) Most likely option (status quo)
+            (a) Most likely option
             (b) Plausible alternatives
             (c) Why others are less likely
 
@@ -311,53 +407,57 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             prompt = base_prompt + clean_indents(f"""
             Units: {getattr(question, 'unit_of_measure', 'inferred')}
             Bounds: {lo} to {hi}
-            {"→ Financial: assume log-normal; anchor to historical ranges" if is_financial else ""}
+            {"→ Financial: assume log-normal" if is_financial else ""}
 
             Analyze:
-            (a) Current level (e.g., S&P 52-wk range)
-            (b) Trend (growth/decay rate)
-            (c) Volatility regime (high VIX → widen intervals)
-            (d) Plausible low (10th %ile)
-            (e) Plausible high (90th %ile)
+            (a) Current level
+            (b) Trend
+            (c) Volatility regime
+            (d) Low scenario (10th %ile)
+            (e) High scenario (90th %ile)
 
             Output percentiles: 10, 20, 40, 60, 80, 90
             Confidence: WW%
             """)
 
-        reasoning = await llm.invoke(prompt)
+        reasoning = await forecaster_llm.invoke(prompt)
         confidence = self._extract_confidence(reasoning, is_financial)
 
         try:
             if q_type == "binary":
+                # ✅ Use parser_llm for structured output
                 pred: BinaryPrediction = await structure_output(
-                    reasoning, BinaryPrediction, model=llm
+                    reasoning, BinaryPrediction, model=self.parser_llm
                 )
                 value = np.clip(pred.prediction_in_decimal, 0.01, 0.99)
             elif q_type == "mcq":
                 parsing_instructions = f"Valid options: {getattr(question, 'options', [])}"
                 pred: PredictedOptionList = await structure_output(
-                    reasoning, PredictedOptionList, model=llm,
+                    reasoning,
+                    PredictedOptionList,
+                    model=self.parser_llm,
                     additional_instructions=parsing_instructions,
                 )
                 value = pred
             else:  # numeric
                 pct_list: List[Percentile] = await structure_output(
-                    reasoning, list[Percentile], model=llm
+                    reasoning,
+                    list[Percentile],
+                    model=self.parser_llm,
                 )
                 dist = NumericDistribution.from_question(pct_list, question)
-                # ✅ Apply financial adjustment if needed
                 if is_financial:
                     dist = self._apply_financial_adjustment(dist, question)
                 value = dist
         except Exception as e:
-            logger.warning(f"Parsing failed for {model_key} on Q{question.id}: {e}")
-            # Fallbacks
+            logger.warning(f"Parsing failed for {model_key} on Q{question.id}: {e}. Using fallback.")
+            # ✅ Type-safe fallbacks
             if q_type == "binary":
                 value = 0.5
             elif q_type == "mcq":
                 opts = getattr(question, "options", ["A", "B"])
-                value = PredictedOptionList({o: 100.0 / len(opts) for o in opts})
-            else:
+                value = PredictedOptionList({o: round(100.0 / len(opts), 1) for o in opts})
+            else:  # numeric
                 lo = getattr(question, "lower_bound", 0)
                 hi = getattr(question, "upper_bound", 100)
                 fallback_pcts = [Percentile(p / 100, lo + (hi - lo) * p / 100) for p in [10, 20, 40, 60, 80, 90]]
@@ -365,130 +465,64 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
 
         return ReasonedPrediction(prediction_value=value, reasoning=reasoning), confidence
 
-    def _extract_confidence(self, text: str, is_financial: bool = False) -> float:
-        match = re.search(r"Confidence:\s*([\d.]+)%?", text, re.IGNORECASE)
-        base_conf = float(match.group(1)) / 100.0 if match else 0.7
-        base_conf = np.clip(base_conf, 0.3, 1.0)
-
-        # ↓ Downweight short-term financial questions (inherently noisy)
-        if is_financial:
-            base_conf *= 0.9
-        return base_conf
-
-    def _get_bounds(self, q: NumericQuestion) -> Tuple[str, str]:
-        lo = q.nominal_lower_bound if q.nominal_lower_bound is not None else q.lower_bound
-        hi = q.nominal_upper_bound if q.nominal_upper_bound is not None else q.upper_bound
-        lo_str = f"≥{lo}" if q.open_lower_bound else f"={lo} (hard min)"
-        hi_str = f"≤{hi}" if q.open_upper_bound else f"={hi} (hard max)"
-        return lo_str, hi_str
-
-    def _apply_financial_adjustment(self, dist: NumericDistribution, question: NumericQuestion) -> NumericDistribution:
-        """
-        For stock/financial numeric questions:
-        - Enforce log-normality (prices can't be negative; multiplicative shocks)
-        - Apply double-median stabilization
-        - Anchor to plausible market regimes
-        """
-        try:
-            # Get percentiles
-            pcts = {int(p.percentile * 100): p.value for p in dist.declared_percentiles}
-            needed = [10, 20, 40, 50, 60, 80, 90]
-
-            # Ensure median (50) exists
-            if 50 not in pcts:
-                if 40 in pcts and 60 in pcts:
-                    pcts[50] = (pcts[40] + pcts[60]) / 2
-                else:
-                    pcts[50] = np.median(list(pcts.values()))
-
-            median = pcts[50]
-            if median <= 0:
-                return dist  # can't log-transform
-
-            # Log-transform, apply double-median, transform back
-            log_pcts = {p: np.log(v) for p, v in pcts.items() if v > 0}
-
-            new_log_pcts = {}
-            for p in needed:
-                if p in log_pcts:
-                    # Pull extremes toward median (robustify)
-                    shrink = 0.4 if abs(p - 50) >= 30 else 0.15
-                    new_log = (1 - shrink) * log_pcts[p] + shrink * np.log(median)
-                    new_log_pcts[p] = new_log
-                else:
-                    # Interpolate
-                    lower = max([k for k in log_pcts.keys() if k <= p], default=min(log_pcts.keys()))
-                    upper = min([k for k in log_pcts.keys() if k >= p], default=max(log_pcts.keys()))
-                    if lower == upper:
-                        new_log_pcts[p] = log_pcts[lower]
-                    else:
-                        w = (p - lower) / (upper - lower)
-                        new_log_pcts[p] = (1 - w) * log_pcts[lower] + w * log_pcts[upper]
-
-            # Back to linear scale
-            new_pcts = {p: np.exp(v) for p, v in new_log_pcts.items()}
-
-            # Build final percentiles (standard set)
-            final_percentiles = [
-                Percentile(percentile=p / 100.0, value=new_pcts[p])
-                for p in [10, 20, 40, 60, 80, 90]
-            ]
-            return NumericDistribution.from_question(final_percentiles, question)
-
-        except Exception as e:
-            logger.warning(f"Financial adjustment failed: {e}")
-            return dist
-
-    # ===== STATISTICALLY OPTIMAL AGGREGATION =====
+    # ===== STATISTICALLY SOUND AGGREGATION WITH TYPE GUARD =====
     async def _run_generic_forecast(self, question: MetaculusQuestion, research: str) -> ReasonedPrediction:
         weights = self._get_dynamic_weights(question)
-        results: List[Tuple[ReasonedPrediction, float, str]] = []
+        raw_results: List[Tuple[ReasonedPrediction, float, str]] = []
 
         for model_key in self.FORECAST_MODELS:
             try:
                 pred, conf = await self._run_forecast_with_confidence(question, research, model_key)
                 effective_weight = weights[model_key] * conf
-                results.append((pred, effective_weight, model_key))
+                raw_results.append((pred, effective_weight, model_key))
                 logger.info(f"✓ {model_key}: conf={conf:.2f}, wt={effective_weight:.2f}")
             except Exception as e:
                 logger.error(f"✗ {model_key} failed: {e}")
 
-        if not results:
+        if not raw_results:
             raise RuntimeError("All models failed.")
 
         q_type = self._categorize_question(question)
         is_financial = self._is_financial_question(question)
-        combined_reasoning = "\n\n".join(f"[{r[2]}] {r[0].reasoning}" for r in results)
+
+        # ✅ Filter to only type-consistent predictions
+        valid_results = []
+        for pred, wt, model_key in raw_results:
+            pv = pred.prediction_value
+            if q_type == "binary" and isinstance(pv, (int, float)):
+                valid_results.append((pred, wt, model_key))
+            elif q_type == "mcq" and isinstance(pv, PredictedOptionList):
+                valid_results.append((pred, wt, model_key))
+            elif q_type == "numeric" and isinstance(pv, NumericDistribution):
+                valid_results.append((pred, wt, model_key))
+            else:
+                logger.warning(f"Discarding {model_key}: expected {q_type}, got {type(pv)}")
+
+        if not valid_results:
+            raise ValueError(f"No valid {q_type} predictions collected.")
+
+        combined_reasoning = "\n\n".join(f"[{r[2]}] {r[0].reasoning}" for r in valid_results)
 
         if q_type == "binary":
-            # ✅ Brier-optimal: weighted *mean*
-            values = []
-            wts = []
-            for pred, wt, _ in results:
-                if isinstance(pred.prediction_value, (int, float)):
-                    values.append(float(pred.prediction_value))
-                    wts.append(wt)
-            if not values:
-                raise ValueError("No valid binary predictions")
-            final_pred = np.average(values, weights=wts)
+            values = [float(r[0].prediction_value) for r in valid_results]
+            weights_list = [r[1] for r in valid_results]
+            final_pred = np.average(values, weights=weights_list)
             return ReasonedPrediction(prediction_value=final_pred, reasoning=combined_reasoning)
 
         elif q_type == "mcq":
             options = getattr(question, "options", [])
             if not options:
                 raise ValueError("MCQ has no options")
-
-            # Dirichlet smoothing (α=0.5)
             alpha = 0.5
-            smoothed = np.full(len(options), alpha * sum(wt for _, wt, _ in results))
-            for pred, wt, _ in results:
-                if isinstance(pred.prediction_value, PredictedOptionList):
-                    for i, opt in enumerate(options):
-                        try:
-                            p = pred.prediction_value.get_probability_for_option(opt)
-                            smoothed[i] += p * wt
-                        except:
-                            smoothed[i] += (1.0 / len(options)) * wt
+            smoothed = np.full(len(options), alpha * sum(wt for _, wt, _ in valid_results))
+            for pred, wt, _ in valid_results:
+                pv = pred.prediction_value  # PredictedOptionList
+                for i, opt in enumerate(options):
+                    try:
+                        p = pv.get_probability_for_option(opt)
+                        smoothed[i] += p * wt
+                    except:
+                        smoothed[i] += (100.0 / len(options)) * wt
             final_probs = smoothed / smoothed.sum()
             final_pred = PredictedOptionList(dict(zip(options, final_probs.tolist())))
             return ReasonedPrediction(prediction_value=final_pred, reasoning=combined_reasoning)
@@ -496,41 +530,29 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         else:  # numeric
             target_percentiles = [10, 20, 40, 60, 80, 90]
             ensemble_pcts = []
-
             for p in target_percentiles:
-                vals = []
-                wts = []
-                for pred, wt, _ in results:
-                    if isinstance(pred.prediction_value, NumericDistribution):
-                        dist = pred.prediction_value
-                        # Find closest declared percentile
-                        closest = min(
-                            dist.declared_percentiles,
-                            key=lambda x: abs(x.percentile - p / 100),
-                        )
-                        if abs(closest.percentile - p / 100) < 0.15:  # within 15pp
-                            vals.append(closest.value)
-                            wts.append(wt)
-
+                vals, wts = [], []
+                for pred, wt, _ in valid_results:
+                    dist = pred.prediction_value  # NumericDistribution
+                    closest = min(
+                        dist.declared_percentiles,
+                        key=lambda x: abs(x.percentile - p / 100),
+                    )
+                    if abs(closest.percentile - p / 100) < 0.15:
+                        vals.append(closest.value)
+                        wts.append(wt)
                 if vals:
-                    if is_financial:
-                        # Log-average for financial
-                        log_vals = [np.log(v) for v in vals if v > 0]
-                        log_wts = [w for v, w in zip(vals, wts) if v > 0]
-                        if log_vals:
-                            log_q = np.average(log_vals, weights=log_wts)
-                            q = np.exp(log_q)
-                        else:
-                            q = np.average(vals, weights=wts)
+                    if is_financial and all(v > 0 for v in vals):
+                        log_vals = [np.log(v) for v in vals]
+                        log_q = np.average(log_vals, weights=wts)
+                        q = np.exp(log_q)
                     else:
                         q = np.average(vals, weights=wts)
                 else:
                     lo = getattr(question, "lower_bound", 0)
                     hi = getattr(question, "upper_bound", 1)
                     q = lo + (hi - lo) * p / 100.0
-
                 ensemble_pcts.append(Percentile(percentile=p / 100.0, value=q))
-
             final_dist = NumericDistribution.from_question(ensemble_pcts, question)
             return ReasonedPrediction(prediction_value=final_dist, reasoning=combined_reasoning)
 
@@ -569,6 +591,7 @@ if __name__ == "__main__":
     if missing:
         raise EnvironmentError(f"Missing environment variables: {missing}")
 
+    # ✅ Configure all roles explicitly
     bot = ConfidenceWeightedEnsembleBot2025(
         research_reports_per_question=1,
         predictions_per_research_report=1,
@@ -577,12 +600,17 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         llms={
             "researcher": GeneralLlm(
-                model=get_model_id("gpt-5.1"),  # ✅ Upgraded
+                model=get_model_id("gpt-5.1"),
                 temperature=0.3,
                 timeout=60,
             ),
+            "summarizer": GeneralLlm(
+                model=get_model_id("gpt-5.1"),
+                temperature=0.2,
+                timeout=45,
+            ),
             "parser": GeneralLlm(
-                model=get_model_id("gpt-5.1"),  # ✅ More reliable parsing
+                model=get_model_id("gpt-5.1"),  # deterministic parsing
                 temperature=0.0,
                 timeout=30,
             ),
