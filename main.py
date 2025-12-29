@@ -33,7 +33,6 @@ logger = logging.getLogger(__name__)
 
 
 def get_model_id(base_name: str) -> str:
-    """Resolve model ID with graceful fallbacks."""
     overrides = {
         "gpt-5.1": os.getenv("FORCE_GPT_5_1_MODEL"),
         "claude-sonnet-4.5": os.getenv("FORCE_CLAUDE_SONNET_4_5_MODEL"),
@@ -57,14 +56,6 @@ def get_model_id(base_name: str) -> str:
 
 
 class ConfidenceWeightedEnsembleBot2025(ForecastBot):
-    """
-    Financial-Credentialed Ensemble Forecaster
-    - Research: AskNews + Tavily
-    - Models: gpt-5, gpt-5.1, claude-sonnet-4.5
-    - Special handling for financial questions
-    - Type-safe parsing with dedicated summarizer & parser LLMs
-    """
-
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
@@ -98,21 +89,18 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             "claude-sonnet-4.5": 1.1,
         }
 
-        # ✅ Dedicated LLMs for roles
+        # ✅ Dedicated LLMs
         self.researcher_llm = self.get_llm("researcher", "llm")
         self.summarizer_llm = self.get_llm("summarizer", "llm")
         self.parser_llm = self.get_llm("parser", "llm")
 
         self._current_question: Optional[MetaculusQuestion] = None
 
-    # ✅ Override get_llm to ensure roles resolve properly
     def get_llm(self, role: str, guarantee_type: Literal["llm", "model_name"] = "llm") -> Any:
         if role in ("default", "researcher", "summarizer", "parser"):
-            # Let parent handle, but ensure fallbacks
             try:
                 return super().get_llm(role, guarantee_type)
             except Exception:
-                # Fallback to reasonable defaults
                 fallback_map = {
                     "researcher": GeneralLlm(model=get_model_id("gpt-5.1"), temperature=0.3, timeout=60),
                     "summarizer": GeneralLlm(model=get_model_id("gpt-5.1"), temperature=0.2, timeout=45),
@@ -126,9 +114,15 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
 
     async def _increment_query_count(self, source: str) -> bool:
         async with self._query_lock:
-            if source == "tavily" and self._tavily_count >= self.MAX_TAVILY_QUERIES:
-                return False
-            if source == "asknews" and self._asknews_count >= self.MAX_ASKNEWS_QUERIES:
+            limits = {
+                "tavily": self.MAX_TAVILY_QUERIES,
+                "asknews": self.MAX_ASKNEWS_QUERIES,
+            }
+            counters = {
+                "tavily": self._tavily_count,
+                "asknews": self._asknews_count,
+            }
+            if counters[source] >= limits[source]:
                 return False
             if source == "tavily":
                 self._tavily_count += 1
@@ -157,9 +151,10 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 q_text = f"{question.question_text} {question.resolution_criteria}"[:250]
                 is_financial = self._is_financial_question(question)
 
-                asknews_query = f"Financial market update: {q_text}" if is_financial else q_text
-                tavily_query = f"Long-term trends and base rates for: {q_text}" if is_financial else q_text
+                asknews_query = f"Financial update: {q_text}" if is_financial else q_text
+                tavily_query = f"Deep context for: {q_text}"
 
+                # Run both sources (no Google)
                 tavily_res = await self._run_tavily_research(tavily_query)
                 asknews_res = await self._run_asknews_research(asknews_query, financial=is_financial)
 
@@ -167,8 +162,8 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 ### Research Summary (as of {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})
                 {"[FINANCIAL QUESTION]" if is_financial else ""}
 
-                {'[AskNews — Breaking Events]' + chr(10) + asknews_res if asknews_res else ''}
-                {'[Tavily — Deep Context]' + chr(10) + tavily_res if tavily_res else ''}
+                {'[AskNews — Breaking Events]' + chr(10) + asknews_res if asknews_res and not asknews_res.startswith('[AskNews error') else ''}
+                {'[Tavily — Deep Context]' + chr(10) + tavily_res if tavily_res and not tavily_res.startswith('[Tavily error') else ''}
 
                 ⚠️ Forecaster Guidance:
                 - Anchor to base rates.
@@ -195,7 +190,8 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                     days=365,
                 ),
             )
-            answer = res.get("answer", "").strip() or "[No summary]"
+            # ✅ Safe None handling
+            answer = (res.get("answer") or "").strip() or "[No summary]"
             snippets = "\n".join(
                 f"• {r['title'][:60]}: {r['content'][:200]}..."
                 for r in res.get("results", [])[:3]
@@ -209,6 +205,8 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             return "[Skipped: AskNews quota exceeded]"
         try:
             categories = ["business", "finance"] if financial else ["politics", "business", "tech"]
+            max_age_hours = (30 if financial else 90) * 24  # ✅ days → hours
+
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
@@ -217,12 +215,13 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                     n_articles=4,
                     return_type="news",
                     categories=categories,
-                    max_age_days=30 if financial else 90,
+                    max_age_hours=max_age_hours,  # ✅ correct param
                 ),
             )
             articles = response.data.articles
             if not articles:
                 return "[No recent news]"
+
             snippets = "\n".join(
                 f"• {a.headline[:70]} ({a.date[:10]}) — {a.snippet[:200]}..."
                 for a in articles[:4]
@@ -233,16 +232,14 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         except Exception as e:
             return f"[AskNews error: {e}]"
 
-    # ===== QUESTION CATEGORIZATION & WEIGHTING =====
+    # ===== Rest of class: question categorization, forecasting, etc. =====
     def _categorize_question(self, q: MetaculusQuestion) -> str:
-        # ✅ FIRST: use actual type — most reliable
         if isinstance(q, BinaryQuestion):
             return "binary"
         elif isinstance(q, MultipleChoiceQuestion):
             return "mcq"
         elif isinstance(q, NumericQuestion):
             return "numeric"
-        # Fallback to heuristics
         text = (q.question_text + " " + (q.background_info or "")).lower()
         if "which" in text or "option" in text or hasattr(q, 'options'):
             return "mcq"
@@ -272,9 +269,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         total = sum(weights.values())
         return {k: v / total for k, v in weights.items()}
 
-    # ===== ROBUST CONFIDENCE EXTRACTION =====
     def _extract_confidence(self, text: str, is_financial: bool = False) -> float:
-        # Try multiple regex patterns
         patterns = [
             r"Confidence:\s*([\d.]+)%?",
             r"confidence level.*?([\d.]+)%?",
@@ -294,16 +289,14 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 except (ValueError, TypeError):
                     continue
 
-        # Semantic fallback
         text_lower = text.lower()
-        low_conf_indicators = ["uncertain", "speculative", "hard to say", "guess", "low confidence"]
-        high_conf_indicators = ["certain", "very likely", "clear", "definitive", "high confidence"]
-        
-        if any(word in text_lower for word in low_conf_indicators):
+        low_conf = ["uncertain", "speculative", "hard to say", "guess"]
+        high_conf = ["certain", "very likely", "clear", "definitive"]
+        if any(w in text_lower for w in low_conf):
             return 0.5
-        if any(word in text_lower for word in high_conf_indicators):
+        if any(w in text_lower for w in high_conf):
             return 0.85
-        return 0.7  # default
+        return 0.7
 
     def _get_bounds(self, q: NumericQuestion) -> Tuple[str, str]:
         lo = q.nominal_lower_bound if q.nominal_lower_bound is not None else q.lower_bound
@@ -316,17 +309,14 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         try:
             pcts = {int(p.percentile * 100): p.value for p in dist.declared_percentiles}
             needed = [10, 20, 40, 50, 60, 80, 90]
-
             if 50 not in pcts:
                 if 40 in pcts and 60 in pcts:
                     pcts[50] = (pcts[40] + pcts[60]) / 2
                 else:
                     pcts[50] = np.median(list(pcts.values()))
-
             median = pcts[50]
             if median <= 0:
                 return dist
-
             log_pcts = {p: np.log(v) for p, v in pcts.items() if v > 0}
             new_log_pcts = {}
             for p in needed:
@@ -342,7 +332,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                     else:
                         w = (p - lower) / (upper - lower)
                         new_log_pcts[p] = (1 - w) * log_pcts[lower] + w * log_pcts[upper]
-
             new_pcts = {p: np.exp(v) for p, v in new_log_pcts.items()}
             final_percentiles = [
                 Percentile(percentile=p / 100.0, value=new_pcts[p])
@@ -353,7 +342,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             logger.warning(f"Financial adjustment failed: {e}")
             return dist
 
-    # ===== CORE FORECASTING WITH TYPE-SAFE PARSING =====
     async def _run_forecast_with_confidence(
         self, question: MetaculusQuestion, research: str, model_key: str
     ) -> Tuple[ReasonedPrediction, float]:
@@ -363,7 +351,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         is_financial = self._is_financial_question(question)
         q_type = self._categorize_question(question)
 
-        # Build prompt
         base_prompt = clean_indents(f"""
         You are a professional superforecaster with finance expertise where relevant.
 
@@ -387,7 +374,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             Output:
             Rationale: ...
             Probability: ZZ% (0–100)
-            Confidence: WW% (50=guess, 100=certain)
+            Confidence: WW%
             """)
         elif q_type == "mcq":
             options = getattr(question, "options", [])
@@ -425,7 +412,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
 
         try:
             if q_type == "binary":
-                # ✅ Use parser_llm for structured output
                 pred: BinaryPrediction = await structure_output(
                     reasoning, BinaryPrediction, model=self.parser_llm
                 )
@@ -451,13 +437,12 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 value = dist
         except Exception as e:
             logger.warning(f"Parsing failed for {model_key} on Q{question.id}: {e}. Using fallback.")
-            # ✅ Type-safe fallbacks
             if q_type == "binary":
                 value = 0.5
             elif q_type == "mcq":
                 opts = getattr(question, "options", ["A", "B"])
                 value = PredictedOptionList({o: round(100.0 / len(opts), 1) for o in opts})
-            else:  # numeric
+            else:
                 lo = getattr(question, "lower_bound", 0)
                 hi = getattr(question, "upper_bound", 100)
                 fallback_pcts = [Percentile(p / 100, lo + (hi - lo) * p / 100) for p in [10, 20, 40, 60, 80, 90]]
@@ -465,7 +450,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
 
         return ReasonedPrediction(prediction_value=value, reasoning=reasoning), confidence
 
-    # ===== STATISTICALLY SOUND AGGREGATION WITH TYPE GUARD =====
     async def _run_generic_forecast(self, question: MetaculusQuestion, research: str) -> ReasonedPrediction:
         weights = self._get_dynamic_weights(question)
         raw_results: List[Tuple[ReasonedPrediction, float, str]] = []
@@ -485,7 +469,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         q_type = self._categorize_question(question)
         is_financial = self._is_financial_question(question)
 
-        # ✅ Filter to only type-consistent predictions
+        # ✅ Type guard
         valid_results = []
         for pred, wt, model_key in raw_results:
             pv = pred.prediction_value
@@ -516,7 +500,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             alpha = 0.5
             smoothed = np.full(len(options), alpha * sum(wt for _, wt, _ in valid_results))
             for pred, wt, _ in valid_results:
-                pv = pred.prediction_value  # PredictedOptionList
+                pv = pred.prediction_value
                 for i, opt in enumerate(options):
                     try:
                         p = pv.get_probability_for_option(opt)
@@ -533,7 +517,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             for p in target_percentiles:
                 vals, wts = [], []
                 for pred, wt, _ in valid_results:
-                    dist = pred.prediction_value  # NumericDistribution
+                    dist = pred.prediction_value
                     closest = min(
                         dist.declared_percentiles,
                         key=lambda x: abs(x.percentile - p / 100),
@@ -556,7 +540,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             final_dist = NumericDistribution.from_question(ensemble_pcts, question)
             return ReasonedPrediction(prediction_value=final_dist, reasoning=combined_reasoning)
 
-    # ===== Routing =====
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
         return await self._run_generic_forecast(question, research)
 
@@ -591,7 +574,6 @@ if __name__ == "__main__":
     if missing:
         raise EnvironmentError(f"Missing environment variables: {missing}")
 
-    # ✅ Configure all roles explicitly
     bot = ConfidenceWeightedEnsembleBot2025(
         research_reports_per_question=1,
         predictions_per_research_report=1,
@@ -610,7 +592,7 @@ if __name__ == "__main__":
                 timeout=45,
             ),
             "parser": GeneralLlm(
-                model=get_model_id("gpt-5.1"),  # deterministic parsing
+                model=get_model_id("gpt-5.1"),
                 temperature=0.0,
                 timeout=30,
             ),
