@@ -54,7 +54,7 @@ def get_model_id(base_name: str) -> str:
     return fallbacks.get(base_name, [base_name])[0]
 
 
-class ConfidenceWeightedEnsembleBot2025(ForecastBot):
+class StructuralConstraintBot(ForecastBot):
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
@@ -166,7 +166,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 is_financial = self._is_financial_question(question)
 
                 asknews_query = f"Financial outlook: {q_text}" if is_financial else q_text
-                tavily_query = f"Deep analysis and statistics for: {q_text}"
+                tavily_query = f"Deep analysis, laws, and procedural constraints for: {q_text}"
 
                 # Run both sources concurrently
                 tavily_res, asknews_res = await asyncio.gather(
@@ -179,12 +179,9 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 [AskNews — Breaking Events]
                 {asknews_res}
 
-                [Tavily — Deep Context]
+                [Tavily — Deep Context & Constraints]
                 {tavily_res}
                 """
-                
-                # We can perform a quick summarization step if text is too long, 
-                # but for accuracy, we pass the raw data to the forecaster.
                 
                 combined = clean_indents(f"""
                 ### Research Data (Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})
@@ -193,8 +190,10 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 {raw_text}
 
                 ⚠️ FORECASTER INSTRUCTIONS:
-                1. IDENTIFY THE REFERENCE CLASS: What similar events have happened before? What was the base rate?
-                2. CHECK RESOLUTION CRITERIA: Be extremely pedantic about definitions.
+                Look specifically for PROCEDURAL DATA:
+                1. How long does the specific legal/administrative process take?
+                2. Are there mandatory waiting periods (e.g., Treaty Article 13)?
+                3. What are the hard deadlines?
                 """)
                 return combined
             except Exception as e:
@@ -276,7 +275,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         q_type = self._categorize_question(question)
         is_financial = self._is_financial_question(question)
 
-        # Reasoning models (GPT-5) are better at complex logic; Claude is better at parsing/Nuance
         if q_type == "binary":
             weights["gpt-5.1"] *= 1.5  # High logic requirement
         elif q_type == "numeric":
@@ -285,14 +283,13 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             else:
                 weights["gpt-5"] *= 1.3
         elif q_type == "mcq":
-            weights["claude-sonnet-4.5"] *= 1.3 # Claude handles long context options well
+            weights["claude-sonnet-4.5"] *= 1.3 
 
         # Normalize
         total = sum(weights.values())
         return {k: v / total for k, v in weights.items()}
 
     def _extract_confidence(self, text: str, is_financial: bool = False) -> float:
-        # Improved regex to catch "Confidence: 80%" or "Confidence: 0.8"
         patterns = [
             r"(?:confidence|certainty):\s*(\d+(?:\.\d+)?)(?:\s*%)?",
             r"probability that this reasoning is correct:\s*(\d+(?:\.\d+)?)",
@@ -303,13 +300,12 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             if match:
                 try:
                     num = float(match.group(1))
-                    if num > 1.0: num /= 100.0 # Handle 80 vs 0.8
+                    if num > 1.0: num /= 100.0 
                     val = num
                     break
                 except ValueError:
                     continue
         
-        # Financial markets are noisier, dampen confidence
         if is_financial:
             val *= 0.85
         
@@ -324,35 +320,29 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
 
     def _apply_financial_adjustment(self, dist: NumericDistribution, question: NumericQuestion) -> NumericDistribution:
         try:
-            # FIX: Pydantic models must be accessed via attributes, not dict keys if they are objects
-            # Assuming dist.declared_percentiles is a list of Percentile objects
             pcts = {int(p.percentile * 100): p.value for p in dist.declared_percentiles}
             
-            # Interpolate median if missing
             if 50 not in pcts:
                 vals = sorted(pcts.values())
                 pcts[50] = np.median(vals) if vals else 0
                 
             median = pcts[50]
-            if median <= 0: return dist # Cannot do log-normal on negative/zero
+            if median <= 0: return dist 
 
-            # Broaden tails for financial fat-tail risk (kurtosis adjustment)
             needed = [10, 20, 40, 50, 60, 80, 90]
             new_pcts = {}
             
             for p in needed:
                 if p in pcts:
                     val = pcts[p]
-                    # If it's a tail (10 or 90), push it further away from median to simulate volatility
                     if p == 10:
-                        val = val * 0.95 if val < median else val # Push down
+                        val = val * 0.95 if val < median else val 
                     elif p == 90:
-                        val = val * 1.05 if val > median else val # Push up
+                        val = val * 1.05 if val > median else val 
                     new_pcts[p] = val
                 else:
-                    new_pcts[p] = median # Fallback
+                    new_pcts[p] = median 
 
-            # FIX: Use Keyword Arguments for Pydantic
             final_percentiles = [
                 Percentile(percentile=p / 100.0, value=new_pcts[p])
                 for p in sorted(new_pcts.keys())
@@ -366,47 +356,69 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         self, question: MetaculusQuestion, research: str, model_key: str
     ) -> Tuple[ReasonedPrediction, float]:
         model_name = self.FORECAST_MODELS[model_key]
-        # FIX: Increased timeout to 400s for reasoning models
         forecaster_llm = GeneralLlm(model=model_name, temperature=0.3, timeout=400, allowed_tries=2)
 
         is_financial = self._is_financial_question(question)
         q_type = self._categorize_question(question)
         
-        # Superforecasting Prompt Structure
+        # Safe extraction of scheduled resolve time if available
+        resolve_time = getattr(question, 'scheduled_resolve_time', 'Unknown (Assume end of current year/period)')
+
+        # --- STRUCTURAL CONSTRAINT ANALYSIS LOGIC ---
         base_prompt = clean_indents(f"""
-        You are a Superforecaster competing in a high-stakes tournament.
-        
+        You are a Superforecaster using the 'Structural Constraint Analysis' methodology.
+        Your goal is not to guess, but to calculate feasibility based on hard constraints (Base Rate + Friction).
+
         CONTEXT:
         Question: {question.question_text}
         Resolution Criteria: {question.resolution_criteria}
         Background: {question.background_info or 'None'}
         Today's Date: {datetime.now().strftime('%Y-%m-%d')}
+        Scheduled Resolution Date: {resolve_time}
 
         RESEARCH DATA:
         {research}
 
-        INSTRUCTIONS:
-        1. Reference Class Forecasting: Identify a class of similar past events. What was the base rate of occurrence?
-        2. Adjust for Specifics: How does this specific case differ from the reference class?
-        3. Aggregation: Consider multiple perspectives (bullish vs bearish).
-        4. Noise Reduction: If the time horizon is long, regress towards the mean/base rate.
+        METHODOLOGY (STRICT ADHERENCE REQUIRED):
+        
+        1. ESTABLISH THE BASELINE (Status Quo):
+           - What is the current known state? (e.g., Current Membership = 32, Current CEO = X).
+           - This is your anchor. Deviations require energy and time.
+
+        2. PERFORM STRUCTURAL CONSTRAINT ANALYSIS (The "Friction" Test):
+           - UPSIDE VECTOR (Growth/Change): What is the *procedural* process for change? (e.g., Ratification, Bill passage, Clinical Trials).
+             - Calculate: [Average Time for Process] vs [Time Remaining until Resolution].
+             - Constraint Rule: If (Time Required) > (Time Remaining), then Growth Probability ≈ 0.
+           - DOWNSIDE VECTOR (Reduction/Reversal): What are the legal/structural exit mechanisms? (e.g., Treaty Article 13, Impeachment, Bankruptcy).
+             - Calculate: [Mandatory Notice Period] vs [Time Remaining].
+             - Constraint Rule: If (Mandatory Notice Period) > (Time Remaining), then Reduction Probability ≈ 0.
+
+        3. ELIMINATE TAIL RISKS via "NEGATIVE KNOWLEDGE":
+           - Prove why specific outcomes are IMPOSSIBLE.
+           - Example: "If N+1 is procedurally impossible (too slow) and N-1 is legally impossible (notice period), then N is the only outcome."
+           - Discard outcomes that violate these physics/legal boundaries.
+
+        4. AGGREGATION:
+           - Only after applying hard constraints, consider soft factors (political will, rhetoric).
+           - Structural constraints ALWAYS override political intent.
         """)
 
         if q_type == "binary":
             prompt = base_prompt + clean_indents(f"""
             OUTPUT FORMAT:
-            Provide a step-by-step derivation.
+            Provide a step-by-step derivation using the 4 steps above.
             Ends with:
-            Rationale: [Summary]
+            Rationale: [Summary of the Structural Analysis]
             Probability: ZZ% (0 to 100)
-            Confidence: WW% (Your confidence in this probability assessment)
+            Confidence: WW% (Your confidence in the structural constraints)
             """)
         elif q_type == "mcq":
             options = getattr(question, "options", [])
             prompt = base_prompt + clean_indents(f"""
             OPTIONS: {options}
             
-            Evaluate each option's likelihood. Assign probabilities summing to 100%.
+            Evaluate each option against the Structural Constraints.
+            Assign 0% to options that are procedurally impossible given the time remaining.
             Ends with:
             Rationale: [Summary]
             Confidence: WW%
@@ -417,6 +429,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
             RANGE: {lo} to {hi}
             Units: {getattr(question, 'unit_of_measure', 'inferred')}
             
+            Apply constraints to narrow the range.
             Provide the 10th, 20th, 40th, 60th, 80th, and 90th percentiles.
             Ends with:
             Rationale: [Summary]
@@ -426,7 +439,7 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
         reasoning = await forecaster_llm.invoke(prompt)
         confidence = self._extract_confidence(reasoning, is_financial)
 
-        # Parsing Logic with Keyword Argument Fixes
+        # Parsing Logic
         try:
             if q_type == "binary":
                 pred: BinaryPrediction = await structure_output(
@@ -462,21 +475,14 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 value = 0.5
             elif q_type == "mcq":
                 opts = getattr(question, "options", ["A", "B"])
-                # FIX: Check if PredictedOptionList expects a dict or list. 
-                # Assuming standard dictionary structure based on previous errors.
                 probs = {o: 100.0 / len(opts) for o in opts}
-                # If structure_output expects a specific format, we mock it here carefully
-                # But for the wrapper, we just return the object.
-                # Assuming PredictedOptionList is a standard Pydantic model:
                 try:
                     value = PredictedOptionList(options=probs)
                 except:
-                    # If it accepts a dict directly (RootModel)
                     value = PredictedOptionList(probs)
             else:
                 lo = getattr(question, "lower_bound", 0)
                 hi = getattr(question, "upper_bound", 100)
-                # FIX: Use Keyword Arguments for Pydantic
                 fallback_pcts = [
                     Percentile(percentile=p / 100.0, value=lo + (hi - lo) * p / 100.0) 
                     for p in [10, 20, 40, 60, 80, 90]
@@ -570,7 +576,6 @@ class ConfidenceWeightedEnsembleBot2025(ForecastBot):
                 else:
                     q_val = 0 # Should not happen
                 
-                # FIX: Keyword arguments
                 ensemble_pcts.append(Percentile(percentile=p / 100.0, value=q_val))
                 
             final_dist = NumericDistribution.from_question(ensemble_pcts, question)
@@ -611,13 +616,12 @@ if __name__ == "__main__":
         raise EnvironmentError(f"Missing environment variables: {missing}")
 
     # Initialize bot with high-timeout configuration
-    bot = ConfidenceWeightedEnsembleBot2025(
+    bot = StructuralConstraintBot(
         research_reports_per_question=1,
         predictions_per_research_report=1,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
-        # LLMs are now handled inside the class __init__ using the robust get_llm
     )
 
     async def run():
