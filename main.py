@@ -3,15 +3,19 @@ import asyncio
 import logging
 import os
 import re
+import json
 from datetime import datetime, timezone
-from typing import Literal, List, Any, Dict, Union, Tuple, Optional
+from typing import Literal, List, Any, Dict, Union, Tuple, Optional, Type, TypeVar
 
 import numpy as np
 import pandas as pd
 from scipy import stats
 from tavily import TavilyClient
 from asknews_sdk import AskNewsSDK
+from pydantic import BaseModel, ValidationError
 
+# Import forecasting tools
+# Ensure you have these installed/available in your environment
 from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
@@ -30,6 +34,68 @@ from forecasting_tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ==========================================
+# 🛡️ PYDANTIC V2 SAFETY HELPERS
+# ==========================================
+
+T = TypeVar("T", bound=BaseModel)
+
+def safe_model(model_cls: Type[T], data: Any) -> T:
+    """
+    Universal factory for Pydantic v2 models to prevent __init__ positional arg errors.
+    Safely handles: Existing Instances, Dicts, JSON Strings, and Duck Typing.
+    """
+    try:
+        # 1. Already an instance? Return it.
+        if isinstance(data, model_cls):
+            return data
+
+        # 2. JSON String? Parse it.
+        if isinstance(data, (str, bytes)):
+            try:
+                # cleans json markdown code blocks if present
+                clean_data = data.replace("```json", "").replace("```", "").strip()
+                return model_cls.model_validate_json(clean_data)
+            except ValueError:
+                # Not valid JSON, might be a raw dict passed as string repr?
+                pass
+
+        # 3. Dictionary? Validate it (The Pydantic V2 standard).
+        if isinstance(data, dict):
+            return model_cls.model_validate(data)
+
+        # 4. Duck Typing (Object with attributes).
+        if hasattr(data, '__dict__'):
+             return model_cls.model_validate(data, from_attributes=True)
+
+        # 5. Fallback: Keyword unpacking (Risky if data isn't a mapping, but worth a try)
+        if isinstance(data, (dict, map)):
+            return model_cls(**data)
+            
+        # 6. Absolute last resort for single-field models (rare usage)
+        # return model_cls(data) # <--- We purposefully avoid this to stop the recursion/error loop
+
+        raise ValueError(f"Data type {type(data)} not compatible with {model_cls.__name__}")
+
+    except (ValidationError, TypeError, ValueError) as e:
+        logger.error(f"❌ MODEL INSTANTIATION FAILED for {model_cls.__name__}")
+        logger.error(f"   Input Type: {type(data)}")
+        logger.debug(f"   Input Preview: {str(data)[:200]}")
+        
+        # Try one desperate fallback for the specific "options" case in PredictedOptionList
+        if model_cls.__name__ == "PredictedOptionList" and isinstance(data, dict):
+             try:
+                 return model_cls(options=data)
+             except Exception:
+                 pass
+
+        raise ValueError(f"Failed to create {model_cls.__name__}: {e}") from e
+
+
+# ==========================================
+# 🤖 MODEL ID HELPERS
+# ==========================================
 
 def get_model_id(base_name: str) -> str:
     overrides = {
@@ -53,6 +119,10 @@ def get_model_id(base_name: str) -> str:
     }
     return fallbacks.get(base_name, [base_name])[0]
 
+
+# ==========================================
+# 🧠 STRUCTURAL CONSTRAINT BOT
+# ==========================================
 
 class StructuralConstraintBot(ForecastBot):
     _max_concurrent_questions = 1
@@ -88,7 +158,7 @@ class StructuralConstraintBot(ForecastBot):
             "claude-sonnet-4.5": 1.1,
         }
 
-        # ✅ Initialize roles via get_llm immediately to ensure they exist
+        # ✅ Initialize roles
         self.researcher_llm = self.get_llm("researcher")
         self.summarizer_llm = self.get_llm("summarizer")
         self.parser_llm = self.get_llm("parser")
@@ -96,29 +166,21 @@ class StructuralConstraintBot(ForecastBot):
         self._current_question: Optional[MetaculusQuestion] = None
 
     def get_llm(self, role: str, guarantee_type: Literal["llm", "model_name"] = "llm") -> Any:
-        """
-        Robust retrieval of LLMs with specific timeouts and temperatures per role.
-        """
-        # Specific configurations for distinct roles
         role_configs = {
             "researcher": {"model": get_model_id("gpt-5.1"), "temp": 0.4, "timeout": 300},
             "summarizer": {"model": get_model_id("gpt-5.1"), "temp": 0.2, "timeout": 300},
-            "parser": {"model": "openrouter/openai/gpt-4o", "temp": 0.0, "timeout": 120}, # gpt-4o is better/cheaper at strict parsing than gpt-5
+            "parser": {"model": "openrouter/openai/gpt-4o", "temp": 0.0, "timeout": 120},
             "default": {"model": get_model_id("gpt-5.1"), "temp": 0.3, "timeout": 400}
         }
 
         try:
-            # Try getting from parent first
             llm = super().get_llm(role, guarantee_type)
-            # If parent returns None or we want to enforce our config for specific missing roles:
             if llm is None and role in role_configs:
                 raise ValueError("Role missing")
             return llm
         except Exception:
-            # Fallback creation
             logger.info(f"⚡ Creating fallback LLM for role: {role}")
             config = role_configs.get(role, role_configs["default"])
-            
             return GeneralLlm(
                 model=config["model"],
                 temperature=config["temp"],
@@ -174,7 +236,6 @@ class StructuralConstraintBot(ForecastBot):
                     self._run_asknews_research(asknews_query, financial=is_financial)
                 )
 
-                # Use Summarizer LLM to synthesize if the content is huge
                 raw_text = f"""
                 [AskNews — Breaking Events]
                 {asknews_res}
@@ -256,18 +317,12 @@ class StructuralConstraintBot(ForecastBot):
 
     # ===== Classification & Weights =====
     def _categorize_question(self, q: MetaculusQuestion) -> str:
-        if isinstance(q, BinaryQuestion):
-            return "binary"
-        elif isinstance(q, MultipleChoiceQuestion):
-            return "mcq"
-        elif isinstance(q, NumericQuestion):
-            return "numeric"
-        # Fallback heuristic
+        if isinstance(q, BinaryQuestion): return "binary"
+        elif isinstance(q, MultipleChoiceQuestion): return "mcq"
+        elif isinstance(q, NumericQuestion): return "numeric"
         text = (q.question_text + " " + (q.background_info or "")).lower()
-        if hasattr(q, 'options') and q.options:
-            return "mcq"
-        if "probability" in text or "will" in text:
-            return "binary"
+        if hasattr(q, 'options') and q.options: return "mcq"
+        if "probability" in text or "will" in text: return "binary"
         return "numeric"
 
     def _get_dynamic_weights(self, question: MetaculusQuestion) -> Dict[str, float]:
@@ -276,16 +331,12 @@ class StructuralConstraintBot(ForecastBot):
         is_financial = self._is_financial_question(question)
 
         if q_type == "binary":
-            weights["gpt-5.1"] *= 1.5  # High logic requirement
+            weights["gpt-5.1"] *= 1.5 
         elif q_type == "numeric":
-            if is_financial:
-                weights["gpt-5"] *= 1.2
-            else:
-                weights["gpt-5"] *= 1.3
+            weights["gpt-5"] *= (1.2 if is_financial else 1.3)
         elif q_type == "mcq":
             weights["claude-sonnet-4.5"] *= 1.3 
 
-        # Normalize
         total = sum(weights.values())
         return {k: v / total for k, v in weights.items()}
 
@@ -305,10 +356,7 @@ class StructuralConstraintBot(ForecastBot):
                     break
                 except ValueError:
                     continue
-        
-        if is_financial:
-            val *= 0.85
-        
+        if is_financial: val *= 0.85
         return np.clip(val, 0.1, 0.95)
 
     def _get_bounds(self, q: NumericQuestion) -> Tuple[str, str]:
@@ -331,14 +379,11 @@ class StructuralConstraintBot(ForecastBot):
 
             needed = [10, 20, 40, 50, 60, 80, 90]
             new_pcts = {}
-            
             for p in needed:
                 if p in pcts:
                     val = pcts[p]
-                    if p == 10:
-                        val = val * 0.95 if val < median else val 
-                    elif p == 90:
-                        val = val * 1.05 if val > median else val 
+                    if p == 10: val = val * 0.95 if val < median else val 
+                    elif p == 90: val = val * 1.05 if val > median else val 
                     new_pcts[p] = val
                 else:
                     new_pcts[p] = median 
@@ -347,6 +392,7 @@ class StructuralConstraintBot(ForecastBot):
                 Percentile(percentile=p / 100.0, value=new_pcts[p])
                 for p in sorted(new_pcts.keys())
             ]
+            # Uses standard factory, assumed safe
             return NumericDistribution.from_question(final_percentiles, question)
         except Exception as e:
             logger.warning(f"Financial adjustment failed: {e}")
@@ -360,8 +406,6 @@ class StructuralConstraintBot(ForecastBot):
 
         is_financial = self._is_financial_question(question)
         q_type = self._categorize_question(question)
-        
-        # Safe extraction of scheduled resolve time if available
         resolve_time = getattr(question, 'scheduled_resolve_time', 'Unknown (Assume end of current year/period)')
 
         # --- STRUCTURAL CONSTRAINT ANALYSIS LOGIC ---
@@ -380,45 +424,39 @@ class StructuralConstraintBot(ForecastBot):
         {research}
 
         METHODOLOGY (STRICT ADHERENCE REQUIRED):
-        
         1. ESTABLISH THE BASELINE (Status Quo):
-           - What is the current known state? (e.g., Current Membership = 32, Current CEO = X).
+           - What is the current known state?
            - This is your anchor. Deviations require energy and time.
 
         2. PERFORM STRUCTURAL CONSTRAINT ANALYSIS (The "Friction" Test):
-           - UPSIDE VECTOR (Growth/Change): What is the *procedural* process for change? (e.g., Ratification, Bill passage, Clinical Trials).
-             - Calculate: [Average Time for Process] vs [Time Remaining until Resolution].
+           - UPSIDE VECTOR (Growth/Change): What is the *procedural* process? (e.g., Ratification).
+             - Calculate: [Average Time for Process] vs [Time Remaining].
              - Constraint Rule: If (Time Required) > (Time Remaining), then Growth Probability ≈ 0.
-           - DOWNSIDE VECTOR (Reduction/Reversal): What are the legal/structural exit mechanisms? (e.g., Treaty Article 13, Impeachment, Bankruptcy).
+           - DOWNSIDE VECTOR (Reduction/Reversal): What are the legal/structural exit mechanisms? (e.g., Treaty Article 13).
              - Calculate: [Mandatory Notice Period] vs [Time Remaining].
              - Constraint Rule: If (Mandatory Notice Period) > (Time Remaining), then Reduction Probability ≈ 0.
 
         3. ELIMINATE TAIL RISKS via "NEGATIVE KNOWLEDGE":
-           - Prove why specific outcomes are IMPOSSIBLE.
-           - Example: "If N+1 is procedurally impossible (too slow) and N-1 is legally impossible (notice period), then N is the only outcome."
-           - Discard outcomes that violate these physics/legal boundaries.
+           - Prove why specific outcomes are IMPOSSIBLE (e.g. "If N+1 is too slow and N-1 is legally blocked, N is the only outcome").
 
         4. AGGREGATION:
-           - Only after applying hard constraints, consider soft factors (political will, rhetoric).
            - Structural constraints ALWAYS override political intent.
         """)
 
         if q_type == "binary":
             prompt = base_prompt + clean_indents(f"""
             OUTPUT FORMAT:
-            Provide a step-by-step derivation using the 4 steps above.
+            Provide a step-by-step derivation.
             Ends with:
-            Rationale: [Summary of the Structural Analysis]
+            Rationale: [Summary]
             Probability: ZZ% (0 to 100)
-            Confidence: WW% (Your confidence in the structural constraints)
+            Confidence: WW% (Your confidence)
             """)
         elif q_type == "mcq":
             options = getattr(question, "options", [])
             prompt = base_prompt + clean_indents(f"""
             OPTIONS: {options}
-            
-            Evaluate each option against the Structural Constraints.
-            Assign 0% to options that are procedurally impossible given the time remaining.
+            Evaluate each option against Constraints. Assign 0% to procedurally impossible options.
             Ends with:
             Rationale: [Summary]
             Confidence: WW%
@@ -428,9 +466,7 @@ class StructuralConstraintBot(ForecastBot):
             prompt = base_prompt + clean_indents(f"""
             RANGE: {lo} to {hi}
             Units: {getattr(question, 'unit_of_measure', 'inferred')}
-            
-            Apply constraints to narrow the range.
-            Provide the 10th, 20th, 40th, 60th, 80th, and 90th percentiles.
+            Apply constraints to narrow the range. Provide 10th-90th percentiles.
             Ends with:
             Rationale: [Summary]
             Confidence: WW%
@@ -439,7 +475,7 @@ class StructuralConstraintBot(ForecastBot):
         reasoning = await forecaster_llm.invoke(prompt)
         confidence = self._extract_confidence(reasoning, is_financial)
 
-        # Parsing Logic
+        # Parsing Logic with Safe Instantiation
         try:
             if q_type == "binary":
                 pred: BinaryPrediction = await structure_output(
@@ -475,11 +511,9 @@ class StructuralConstraintBot(ForecastBot):
                 value = 0.5
             elif q_type == "mcq":
                 opts = getattr(question, "options", ["A", "B"])
+                # FIX: Use safe_model to handle dict->model creation
                 probs = {o: 100.0 / len(opts) for o in opts}
-                try:
-                    value = PredictedOptionList(options=probs)
-                except:
-                    value = PredictedOptionList(probs)
+                value = safe_model(PredictedOptionList, {"options": probs})
             else:
                 lo = getattr(question, "lower_bound", 0)
                 hi = getattr(question, "upper_bound", 100)
@@ -507,7 +541,7 @@ class StructuralConstraintBot(ForecastBot):
         if not raw_results:
             raise RuntimeError("All models failed.")
 
-        # Aggregation Logic
+        # Aggregation
         q_type = self._categorize_question(question)
         is_financial = self._is_financial_question(question)
         
@@ -528,12 +562,13 @@ class StructuralConstraintBot(ForecastBot):
                 pv = pred.prediction_value
                 for i, opt in enumerate(options):
                     try:
-                        # Handle potential attribute error if method names differ
+                        # Defensive check for probability extraction
                         if hasattr(pv, 'get_probability_for_option'):
                             p = pv.get_probability_for_option(opt)
                         elif isinstance(pv, dict):
                             p = pv.get(opt, 0)
                         elif hasattr(pv, 'options'):
+                             # Assuming pv.options is a dict
                              p = pv.options.get(opt, 0)
                         else:
                              p = 1.0/len(options)
@@ -542,13 +577,10 @@ class StructuralConstraintBot(ForecastBot):
                         smoothed[i] += (100.0 / len(options)) * wt
             
             final_probs = smoothed / total_weight if total_weight > 0 else smoothed
-            # Output dict
             probs_dict = dict(zip(options, final_probs.tolist()))
-            try:
-                final_pred = PredictedOptionList(options=probs_dict)
-            except:
-                final_pred = PredictedOptionList(probs_dict)
-                
+            
+            # FIX: Use safe_model to create the final object
+            final_pred = safe_model(PredictedOptionList, {"options": probs_dict})
             return ReasonedPrediction(prediction_value=final_pred, reasoning=combined_reasoning)
 
         else:  # numeric
@@ -574,7 +606,7 @@ class StructuralConstraintBot(ForecastBot):
                     else:
                         q_val = np.average(vals, weights=wts)
                 else:
-                    q_val = 0 # Should not happen
+                    q_val = 0 
                 
                 ensemble_pcts.append(Percentile(percentile=p / 100.0, value=q_val))
                 
@@ -609,13 +641,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Check env vars
     required = ["TAVILY_API_KEY", "ASKNEWS_CLIENT_ID", "ASKNEWS_CLIENT_SECRET"]
     missing = [k for k in required if not os.getenv(k)]
     if missing:
         raise EnvironmentError(f"Missing environment variables: {missing}")
 
-    # Initialize bot with high-timeout configuration
     bot = StructuralConstraintBot(
         research_reports_per_question=1,
         predictions_per_research_report=1,
@@ -635,8 +665,16 @@ if __name__ == "__main__":
         reports = []
         for tid in targets:
             logger.info(f"▶ Forecasting tournament: {tid}")
-            r = await bot.forecast_on_tournament(tid, return_exceptions=True)
-            reports.extend(r)
+            try:
+                # Basic error handling for the loop
+                r = await bot.forecast_on_tournament(tid, return_exceptions=True)
+                reports.extend(r)
+            except ExceptionGroup as eg:
+                logger.error(f"Tournament {tid} had sub-failures:")
+                for exc in eg.exceptions:
+                     logger.error(f"  -> {exc}")
+            except Exception as e:
+                logger.error(f"Critical error in tournament {tid}: {e}")
 
         bot.log_report_summary(reports)
         logger.info(f"📊 Queries used — Tavily: {bot._tavily_count}, AskNews: {bot._asknews_count}")
