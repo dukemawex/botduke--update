@@ -635,9 +635,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=["32916", "ACX2026", "minibench", "all"],
+        choices=["32916", "minibench", "all"],
         default="all",
-        help="Tournament: 32916, ACX2026, minibench, or all",
+        help="Tournament: 32916, minibench, or all",
     )
     args = parser.parse_args()
 
@@ -657,7 +657,6 @@ if __name__ == "__main__":
     async def run():
         tournament_map = {
             "32916": 32916,
-            "ACX2026": "ACX2026",
             "minibench": MetaculusApi.CURRENT_MINIBENCH_ID,
         }
         targets = list(tournament_map.values()) if args.mode == "all" else [tournament_map[args.mode]]
