@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Literal, List, Any, Dict, Union, Tuple, Optional, Type, TypeVar
 
 from pydantic import BaseModel, ValidationError
+from tavily import TavilyClient
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -39,7 +40,7 @@ from forecasting_tools import (
     structure_output,
 )
 
-# Load environment variables (including the newly added EXA_API_KEY)
+# Load environment variables (including the newly added EXA_API_KEY and TAVILY_API_KEY)
 dotenv.load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -80,7 +81,7 @@ def safe_model(model_cls: Type[T], data: Any) -> T:
 
 class SpringAdvancedForecastingBot(ForecastBot):
     """
-    Bot leveraging the new EXA_API_KEY for neural search.
+    Bot leveraging Exa, AskNews, and Tavily for triple-engine research.
     Ensemble: GPT-5.1, GPT-5, Claude 4.5.
     Critic: GPT-5.
     """
@@ -94,8 +95,11 @@ class SpringAdvancedForecastingBot(ForecastBot):
         
         # Verify Key Presence
         if not os.getenv("EXA_API_KEY"):
-            logger.warning("⚠️ EXA_API_KEY not found in environment. Research will use Fallback Heuristics.")
+            logger.warning("⚠️ EXA_API_KEY not found in environment.")
+        if not os.getenv("TAVILY_API_KEY"):
+            logger.warning("⚠️ TAVILY_API_KEY not found in environment.")
         
+        self.tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
         self.forecasters = {
             "gpt-5.1": "openrouter/openai/gpt-5.1",
             "gpt-5": "openrouter/openai/gpt-5",
@@ -112,8 +116,22 @@ class SpringAdvancedForecastingBot(ForecastBot):
         adjusted_p = 1 / (1 + np.exp(-adjusted_logit))
         return round(float(np.clip(adjusted_p * 100, 1.0, 99.0)), 2)
 
+    async def _run_tavily_search(self, query: str) -> str:
+        """Helper to run a Tavily search."""
+        try:
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None, 
+                lambda: self.tavily.search(query=query, search_depth="advanced", max_results=5)
+            )
+            context = "\n".join([f"Source: {r['url']}\nContent: {r['content']}" for r in response.get('results', [])])
+            return f"[Tavily Data]\n{context}"
+        except Exception as e:
+            logger.error(f"Tavily search failed: {e}")
+            return "[Tavily search failed]"
+
     async def run_research(self, question: MetaculusQuestion) -> str:
-        """Now uses Exa-powered neural search via EXA_API_KEY."""
+        """Uses Exa, AskNews, and Tavily for high-density research."""
         async with self._concurrency_limiter:
             researcher = self.get_llm("researcher")
             prompt = clean_indents(f"""
@@ -121,17 +139,27 @@ class SpringAdvancedForecastingBot(ForecastBot):
                 Identify hard constraints, status-quo benchmarks, and friction barriers.
             """)
 
+            research_tasks = []
+            
+            # Add Tavily to the stack
+            research_tasks.append(self._run_tavily_search(question.question_text[:200]))
+
             try:
                 if researcher == "asknews/news-summaries":
-                    return await AskNewsSearcher().call_preconfigured_version(researcher, prompt)
+                    research_tasks.append(AskNewsSearcher().call_preconfigured_version(researcher, prompt))
                 elif researcher.startswith("smart-searcher"):
-                    # The EXA_API_KEY is automatically used by the SmartSearcher class
                     searcher = SmartSearcher(model=researcher.split("/")[-1], num_searches_to_run=2)
-                    return await searcher.invoke(prompt)
-                return await self.get_llm("researcher", "llm").invoke(prompt)
+                    research_tasks.append(searcher.invoke(prompt))
+                else:
+                    research_tasks.append(self.get_llm("researcher", "llm").invoke(prompt))
+                
+                results = await asyncio.gather(*research_tasks)
+                combined_research = "\n\n".join(results)
+                return combined_research
+
             except Exception as e:
                 logger.error(f"Research failure (Check API keys): {e}")
-                return "Research failed. Using internal priors and structural friction logic."
+                return "Research partially failed. Using available priors and structural friction logic."
 
     async def _run_critic_layer(self, question: MetaculusQuestion, research: str, forecasts: Dict[str, Any]) -> Any:
         """Meta-Critic pass to synthesize the ensemble consensus."""
