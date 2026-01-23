@@ -252,7 +252,7 @@ if __name__ == "__main__":
         publish_reports_to_metaculus=True,
         llms={
             "researcher": "smart-searcher/openrouter/openai/gpt-4o",
-            "parser": "openai/gpt-4o-mini",
+            "parser": "openrouter/openai/gpt-4o-mini",
         }
     )
 
