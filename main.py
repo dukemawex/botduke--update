@@ -168,26 +168,39 @@ class SpringAdvancedForecastingBot(ForecastBot):
         self.asknews_client_secret = os.getenv("ASKNEWS_CLIENT_SECRET")
         self._recent_predictions = []
 
-    @property
+    # ✅ FIXED: Must be a METHOD, not a property
     def _llm_config_defaults(self) -> Dict[str, str]:
-        """Define default models for all custom LLM roles to eliminate warnings."""
+        """Define default models for all custom LLM roles."""
         return {
             "default": "openrouter/openai/gpt-5",
             "parser": "openrouter/openai/gpt-4o-mini",
             "summarizer": "openrouter/openai/gpt-4o-mini",
-            "researcher": "openrouter/openai/gpt-4o-search-preview",  # Note: overridden by custom run_research
+            "researcher": "openrouter/openai/gpt-4o-search-preview",
             "query_optimizer": "openrouter/openai/gpt-4o-mini",
             "critic": "openrouter/openai/gpt-5",
             "red_team": "openrouter/openai/gpt-4o",
         }
 
+    # ✅ REVISED: Light calibration that preserves justified high-confidence predictions
     def apply_bayesian_calibration(self, estimate_pct: float) -> float:
-        p = np.clip(estimate_pct / 100.0, 0.005, 0.995)
-        alpha = 0.92
-        logit_p = np.log(p / (1 - p))
-        adjusted_logit = (logit_p * alpha) + 0.08
-        adjusted_p = 1 / (1 + np.exp(-adjusted_logit))
-        return round(float(np.clip(adjusted_p * 100, 1.0, 99.0)), 2)
+        """
+        Apply mild calibration to avoid catastrophic overconfidence,
+        while preserving strong signals (allows >80% and <10%).
+        - 95% → ~90%
+        - 99% → ~95%
+        - 5% → ~7%
+        - 1% → ~5%
+        """
+        p = estimate_pct / 100.0
+        if p >= 0.95:
+            # Map [0.95, 1.0] → [0.90, 0.95]
+            p = 0.90 + 0.05 * (p - 0.95) / 0.05
+        elif p <= 0.05:
+            # Map [0.0, 0.05] → [0.05, 0.07]
+            p = 0.05 + 0.02 * (p / 0.05)
+        # Safety clip
+        p = np.clip(p, 0.01, 0.99)
+        return round(float(p * 100), 2)
 
     async def _optimize_search_query(self, question: MetaculusQuestion) -> str:
         llm = self.get_llm("query_optimizer", "llm")
@@ -418,7 +431,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         final_p = self.apply_bayesian_calibration(final_p * 100) / 100.0
 
         if any(x in research.lower() for x in ["physically impossible", "logically impossible", "violates known laws"]):
-            final_p = min(final_p, 0.01)
+            final_p = min(final_p, 0.05)  # Allow down to 5%
 
         self._recent_predictions.append((question, final_p))
         comment = f"### Ensemble Analysis\n**Models:** {forecast_map}\n**Critic:** {critique[:1000]}..."
