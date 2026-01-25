@@ -14,6 +14,7 @@ from typing import Literal, List, Any, Dict, Union, Tuple, Optional, Type, TypeV
 
 from pydantic import BaseModel, ValidationError
 from tavily import TavilyClient
+import httpx
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -40,7 +41,7 @@ from forecasting_tools import (
     structure_output,
 )
 
-# Load environment variables (including the newly added EXA_API_KEY and TAVILY_API_KEY)
+# Load environment variables
 dotenv.load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -57,23 +58,69 @@ def sanitize_llm_json(text: str) -> str:
         nums = re.findall(r"[-+]?\d*\.\d+|\d+", val)
         return f'"{match.group(1)}": {nums[0]}' if nums else match.group(0)
     text = re.sub(r'"(value|percentile)":\s*"([^"]+)"', clean_num, text)
+    # Remove any trailing/leading non-JSON
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
     return text
 
 T = TypeVar("T", bound=BaseModel)
 
 def safe_model(model_cls: Type[T], data: Any) -> T:
-    """Universal factory for Pydantic v2 models with sanitization."""
     try:
-        if isinstance(data, model_cls): return data
+        if isinstance(data, model_cls): 
+            return data
         if isinstance(data, (str, bytes)):
             clean_data = sanitize_llm_json(data)
-            clean_data = clean_data.replace("```json", "").replace("```", "").strip()
             return model_cls.model_validate_json(clean_data)
-        if isinstance(data, dict): return model_cls.model_validate(data)
+        if isinstance(data, dict): 
+            return model_cls.model_validate(data)
         return model_cls(**data)
     except Exception as e:
         logger.error(f"❌ MODEL INSTANTIATION FAILED for {model_cls.__name__}: {e}")
         raise
+
+# ==========================================
+# 🔍 EXA SEARCH CLIENT
+# ==========================================
+
+class ExaSearcher:
+    def __init__(self):
+        self.api_key = os.getenv("EXA_API_KEY")
+        if not self.api_key:
+            raise ValueError("EXA_API_KEY is required for Exa search.")
+        self.base_url = "https://api.exa.ai/search"
+
+    async def search(self, query: str, num_results: int = 5) -> str:
+        headers = {
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "query": query,
+            "numResults": num_results,
+            "type": "neural",
+            "useAutoprompt": True,
+            "category": "news"
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(self.base_url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                results = []
+                for r in data.get("results", []):
+                    title = r.get("title", "No title")
+                    url = r.get("url", "")
+                    snippet = r.get("text", "")[:500]
+                    results.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet}")
+                return "[Exa Search Results]\n" + "\n\n".join(results)
+        except Exception as e:
+            logger.error(f"Exa search failed: {e}")
+            return "[Exa search failed]"
 
 # ==========================================
 # 🤖 ADVANCED ENSEMBLE BOT (Spring 2026)
@@ -93,13 +140,17 @@ class SpringAdvancedForecastingBot(ForecastBot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        # Verify Key Presence
-        if not os.getenv("EXA_API_KEY"):
-            logger.warning("⚠️ EXA_API_KEY not found in environment.")
-        if not os.getenv("TAVILY_API_KEY"):
-            logger.warning("⚠️ TAVILY_API_KEY not found in environment.")
+        required_keys = ["EXA_API_KEY", "TAVILY_API_KEY", "ASKNEWS_CLIENT_ID", "ASKNEWS_CLIENT_SECRET"]
+        missing = [k for k in required_keys if not os.getenv(k)]
+        if missing:
+            logger.warning(f"⚠️ Missing API keys: {missing}")
         
         self.tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+        self.exa_searcher = ExaSearcher() if os.getenv("EXA_API_KEY") else None
+        self.asknews_client_id = os.getenv("ASKNEWS_CLIENT_ID")
+        self.asknews_client_secret = os.getenv("ASKNEWS_CLIENT_SECRET")
+        
+        # 🔒 PRESERVING YOUR MODEL NAMES EXACTLY AS REQUESTED
         self.forecasters = {
             "gpt-5.1": "openrouter/openai/gpt-5.1",
             "gpt-5": "openrouter/openai/gpt-5",
@@ -108,7 +159,6 @@ class SpringAdvancedForecastingBot(ForecastBot):
         self.critic_model = "openrouter/openai/gpt-5"
 
     def apply_bayesian_calibration(self, estimate_pct: float) -> float:
-        """Contracts log-odds toward 50% to mitigate overconfidence."""
         p = np.clip(estimate_pct / 100.0, 0.005, 0.995)
         alpha = 0.92 
         logit_p = np.log(p / (1 - p))
@@ -117,7 +167,6 @@ class SpringAdvancedForecastingBot(ForecastBot):
         return round(float(np.clip(adjusted_p * 100, 1.0, 99.0)), 2)
 
     async def _run_tavily_search(self, query: str) -> str:
-        """Helper to run a Tavily search."""
         try:
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
@@ -130,69 +179,109 @@ class SpringAdvancedForecastingBot(ForecastBot):
             logger.error(f"Tavily search failed: {e}")
             return "[Tavily search failed]"
 
+    async def _run_exa_search(self, query: str) -> str:
+        if not self.exa_searcher:
+            return "[Exa not configured]"
+        return await self.exa_searcher.search(query, num_results=5)
+
+    async def _run_asknews_search(self, query: str) -> str:
+        try:
+            searcher = AskNewsSearcher(
+                client_id=self.asknews_client_id,
+                client_secret=self.asknews_client_secret
+            )
+            result = await searcher.call_preconfigured_version("asknews/news-summaries", query)
+            return f"[AskNews Data]\n{result}"
+        except Exception as e:
+            logger.error(f"AskNews search failed: {e}")
+            return "[AskNews search failed]"
+
     async def run_research(self, question: MetaculusQuestion) -> str:
-        """Uses Exa, AskNews, and Tavily for high-density research."""
         async with self._concurrency_limiter:
-            researcher = self.get_llm("researcher")
-            prompt = clean_indents(f"""
-                Context: {question.question_text}
-                Identify hard constraints, status-quo benchmarks, and friction barriers.
-            """)
-
-            research_tasks = []
-            
-            # Add Tavily to the stack
-            research_tasks.append(self._run_tavily_search(question.question_text[:200]))
-
+            query = question.question_text[:200]
+            tasks = [
+                self._run_tavily_search(query),
+                self._run_exa_search(query),
+                self._run_asknews_search(query)
+            ]
             try:
-                if researcher == "asknews/news-summaries":
-                    research_tasks.append(AskNewsSearcher().call_preconfigured_version(researcher, prompt))
-                elif researcher.startswith("smart-searcher"):
-                    searcher = SmartSearcher(model=researcher.split("/")[-1], num_searches_to_run=2)
-                    research_tasks.append(searcher.invoke(prompt))
-                else:
-                    research_tasks.append(self.get_llm("researcher", "llm").invoke(prompt))
-                
-                results = await asyncio.gather(*research_tasks)
-                combined_research = "\n\n".join(results)
-                return combined_research
-
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                cleaned = []
+                for res in results:
+                    if isinstance(res, Exception):
+                        cleaned.append(f"[Search failed: {str(res)}]")
+                    else:
+                        cleaned.append(res)
+                return "\n\n".join(cleaned)
             except Exception as e:
                 logger.error(f"Research failure (Check API keys): {e}")
-                return "Research partially failed. Using available priors and structural friction logic."
+                return "Research partially failed."
 
     async def _run_critic_layer(self, question: MetaculusQuestion, research: str, forecasts: Dict[str, Any]) -> Any:
-        """Meta-Critic pass to synthesize the ensemble consensus."""
         llm = GeneralLlm(model=self.critic_model, temperature=0.0)
-        ensemble_json = json.dumps(forecasts, indent=2)
         
+        # 🔧 CRITICAL: Enforce JSON-only output
+        if isinstance(question, BinaryQuestion):
+            schema_example = '{"prediction_in_decimal": 0.75}'
+            out_type = BinaryPrediction
+        elif isinstance(question, MultipleChoiceQuestion):
+            example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
+            schema_example = json.dumps({"predicted_options": example_opts})
+            out_type = PredictedOptionList
+        else:
+            schema_example = '[{"percentile": 10, "value": 5}, {"percentile": 50, "value": 10}, {"percentile": 90, "value": 20}]'
+            out_type = list[Percentile]
+
         prompt = clean_indents(f"""
-            Superforecaster Critic. Question: {question.question_text}.
-            Research: {research}.
-            Ensemble: {ensemble_json}.
-            Synthesize the final, most logically sound forecast. Fix cognitive biases.
+            Question: {question.question_text}
+            Research: {research}
+            Ensemble Forecasts: {json.dumps(forecasts)}
+
+            You are a superforecaster synthesizing final predictions.
+            OUTPUT ONLY A VALID JSON OBJECT THAT MATCHES THIS SCHEMA EXAMPLE:
+            {schema_example}
+
+            RULES:
+            - NO MARKDOWN. NO EXPLANATION. NO PREFIX/SUFFIX TEXT.
+            - ONLY OUTPUT THE JSON.
+            - Ensure probabilities sum to 1.0 for MCQ.
+            - For binary, prediction_in_decimal must be between 0.0 and 1.0.
         """)
         
-        if isinstance(question, BinaryQuestion): out_type = BinaryPrediction
-        elif isinstance(question, MultipleChoiceQuestion): out_type = PredictedOptionList
-        else: out_type = list[Percentile]
-
         critique = await llm.invoke(prompt)
         self._last_critique = critique
         return await structure_output(sanitize_llm_json(critique), out_type, model=self.get_llm("parser", "llm"))
 
     async def _get_model_forecast(self, model_id: str, question: MetaculusQuestion, research: str) -> Any:
-        """Invokes specific model with Structural Constraint Analysis."""
         llm = GeneralLlm(model=model_id, temperature=0.1)
+        
+        # 🔧 CRITICAL: Force JSON-only response
+        if isinstance(question, BinaryQuestion):
+            schema_example = '{"prediction_in_decimal": 0.35}'
+            out_type = BinaryPrediction
+        elif isinstance(question, MultipleChoiceQuestion):
+            example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
+            schema_example = json.dumps({"predicted_options": example_opts})
+            out_type = PredictedOptionList
+        else:
+            schema_example = '[{"percentile": 10, "value": 100}, {"percentile": 50, "value": 200}, {"percentile": 90, "value": 500}]'
+            out_type = list[Percentile]
+
         prompt = clean_indents(f"""
-            Question: {question.question_text}. Research: {research}.
-            Apply 'Negative Knowledge': Why is change impossible? Favor status quo.
+            Question: {question.question_text}
+            Research: {research}
+
+            Apply 'Negative Knowledge': Why might change be impossible? Favor status quo.
+
+            OUTPUT ONLY A VALID JSON OBJECT THAT MATCHES THIS SCHEMA EXAMPLE:
+            {schema_example}
+
+            RULES:
+            - DO NOT include reasoning, markdown, or extra text.
+            - ONLY output the JSON.
+            - For binary: use key "prediction_in_decimal" with value between 0.0 and 1.0.
         """)
         
-        if isinstance(question, BinaryQuestion): out_type = BinaryPrediction
-        elif isinstance(question, MultipleChoiceQuestion): out_type = PredictedOptionList
-        else: out_type = list[Percentile]
-
         raw = await llm.invoke(prompt)
         return await structure_output(sanitize_llm_json(raw), out_type, model=self.get_llm("parser", "llm"))
 
@@ -223,7 +312,8 @@ class SpringAdvancedForecastingBot(ForecastBot):
         aligned_options = [{"option_name": name, "probability": current_options.get(name, 0.0)} for name in option_names]
         
         total = sum(o["probability"] for o in aligned_options)
-        for o in aligned_options: o["probability"] /= (total if total > 0 else 1.0)
+        for o in aligned_options: 
+            o["probability"] /= (total if total > 0 else 1.0)
         
         final_val = safe_model(PredictedOptionList, {"predicted_options": aligned_options})
         return ReasonedPrediction(prediction_value=final_val, reasoning=f"### MCQ Synthesis\n{self._last_critique[:1000]}")
@@ -256,7 +346,6 @@ if __name__ == "__main__":
         }
     )
 
-    client = MetaculusClient()
     TARGETS = ["32916", "minibench"]
 
     async def run():
