@@ -5,17 +5,16 @@ import os
 import re
 import json
 import time
-import random
-import numpy as np
-import pandas as pd
-import dotenv
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, List, Any, Dict, Union, Tuple, Optional, Type, TypeVar
+from typing import Literal, Any, Dict, List, Optional
 
-from pydantic import BaseModel, ValidationError
-from tavily import TavilyClient
+import numpy as np
+import dotenv
+from pydantic import BaseModel
 import httpx
+
+from tavily import TavilyClient
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -28,12 +27,9 @@ from forecasting_tools import (
     NumericDistribution,
     NumericQuestion,
     DateQuestion,
-    DatePercentile,
     Percentile,
     ConditionalQuestion,
-    ConditionalPrediction,
     PredictionTypes,
-    PredictionAffirmed,
     BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
@@ -44,7 +40,6 @@ from forecasting_tools import (
 
 # Load environment variables
 dotenv.load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 LOGS_DIR = Path("logs")
@@ -68,16 +63,14 @@ def sanitize_llm_json(text: str) -> str:
         text = text[:-3]
     return text.strip()
 
-T = TypeVar("T", bound=BaseModel)
-
-def safe_model(model_cls: Type[T], data: Any) -> T:
+def safe_model(model_cls: type[BaseModel], data: Any) -> BaseModel:
     try:
-        if isinstance(data, model_cls): 
+        if isinstance(data, model_cls):
             return data
         if isinstance(data, (str, bytes)):
             clean_data = sanitize_llm_json(data)
             return model_cls.model_validate_json(clean_data)
-        if isinstance(data, dict): 
+        if isinstance(data, dict):
             return model_cls.model_validate(data)
         return model_cls(**data)
     except Exception as e:
@@ -124,55 +117,22 @@ class ExaSearcher:
             return "[Exa search failed]"
 
 # ==========================================
-# 🧠 FORECASTING PRINCIPLES
+# 🧠 GENERAL FORECASTING PRINCIPLES (DOMAIN-AGNOSTIC)
 # ==========================================
 
 class ForecastingPrinciples:
     @staticmethod
-    def get_base_rate(question_text: str) -> str:
-        qt = question_text.lower()
-        if any(kw in qt for kw in ["election", "win", "president", "prime minister"]) and "female" in qt:
-            return "BASE RATE: Only ~12% of non-incumbent female candidates win national executive elections in runoff systems (1990–2025)."
-        elif "ai" in qt and ("by 2030" in qt or "by 2026" in qt or "by 2027" in qt):
-            return "BASE RATE: ~78% of AI milestone predictions on Metaculus >3 years out resolve 'no'."
-        elif "default" in qt and ("country" in qt or "nation" in qt):
-            return "BASE RATE: Sovereign defaults occur in ~2.5% of country-years; higher in emerging markets (~5%)."
-        elif "war" in qt or "conflict" in qt:
-            return "BASE RATE: Interstate wars are rare (<0.5% per dyad-year); civil conflicts more common but still <2%."
-        else:
-            return "BASE RATE: No strong historical base rate available. Use general domain priors."
+    def get_generic_base_rate() -> str:
+        return "BASE RATE: In the absence of strong evidence, default to historical frequencies or uniform priors where applicable. Most novel events have low base rates."
 
     @staticmethod
-    def get_fermi_decomposition(question_text: str) -> str:
-        qt = question_text.lower()
-        if "default" in qt:
-            return """
-FERMI DECOMPOSITION:
-1. Probability of severe economic recession (P1)
-2. Probability of debt-to-GDP > 90% (P2)
-3. Probability of political instability (P3)
-4. Probability of access to IMF/external bailout (P4)
-Final probability ≈ P1 × P2 × P3 × (1 - P4)
+    def get_generic_fermi_prompt() -> str:
+        return """
+FERMI GUIDANCE:
+Decompose the problem into independent factors whose probabilities or values can be estimated.
+Multiply or combine these factors logically.
+Account for uncertainty in each step.
 """
-        elif "ai" in qt and "capable" in qt:
-            return """
-FERMI DECOMPOSITION:
-1. Probability of sufficient compute availability (P1)
-2. Probability of algorithmic breakthrough (P2)
-3. Probability of no regulatory ban (P3)
-4. Probability of talent retention (P4)
-Final ≈ P1 × P2 × P3 × P4
-"""
-        elif "election" in qt and "win" in qt:
-            return """
-FERMI DECOMPOSITION:
-1. Probability of making top 2 in first round (P1)
-2. Probability of favorable runoff coalition dynamics (P2)
-3. Probability of no major scandal (P3)
-4. Probability of economic conditions favoring outsider (P4)
-Final ≈ P1 × P2 × P3 × P4
-"""
-        return ""
 
     @staticmethod
     def apply_time_decay(prob: float, close_time: Optional[datetime]) -> float:
@@ -192,56 +152,31 @@ Final ≈ P1 × P2 × P3 × P4
             return prob
 
 # ==========================================
-# 🤖 COMPETITION-GRADE FORECASTING BOT
+# 🤖 GENERAL-PURPOSE ADVANCED FORECASTING BOT
 # ==========================================
 
 class SpringAdvancedForecastingBot(ForecastBot):
-    _max_concurrent_questions = 1
-    _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
-        required_keys = [
-            "OPENROUTER_API_KEY",
-            "EXA_API_KEY",
-            "TAVILY_API_KEY",
-            "ASKNEWS_CLIENT_ID",
-            "ASKNEWS_CLIENT_SECRET"
-        ]
-        missing = [k for k in required_keys if not os.getenv(k)]
-        if missing:
-            logger.warning(f"⚠️ Missing API keys: {missing}")
-        
-        self.tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+
+        self.tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY")) if os.getenv("TAVILY_API_KEY") else None
         self.exa_searcher = ExaSearcher() if os.getenv("EXA_API_KEY") else None
         self.asknews_client_id = os.getenv("ASKNEWS_CLIENT_ID")
         self.asknews_client_secret = os.getenv("ASKNEWS_CLIENT_SECRET")
-        
-        # Preserve your model names exactly
-        self.forecasters = {
-            "gpt-5.1": "openrouter/openai/gpt-5.1",
-            "gpt-5": "openrouter/openai/gpt-5",
-            "claude-4.5": "openrouter/anthropic/claude-4.5-sonnet"
-        }
-        self.critic_model = "openrouter/openai/gpt-5"
-        self.red_team_model = "openrouter/openai/gpt-4o"
-        self.query_optimizer_model = "openrouter/openai/gpt-4o-mini"
-        
-        # Memory for consistency checks
         self._recent_predictions = []
 
     def apply_bayesian_calibration(self, estimate_pct: float) -> float:
         p = np.clip(estimate_pct / 100.0, 0.005, 0.995)
-        alpha = 0.92 
+        alpha = 0.92
         logit_p = np.log(p / (1 - p))
         adjusted_logit = (logit_p * alpha) + 0.08
         adjusted_p = 1 / (1 + np.exp(-adjusted_logit))
         return round(float(np.clip(adjusted_p * 100, 1.0, 99.0)), 2)
 
     async def _optimize_search_query(self, question: MetaculusQuestion) -> str:
-        llm = GeneralLlm(model=self.query_optimizer_model, temperature=0.3)
+        llm = self.get_llm("query_optimizer", "llm") or self.get_llm("parser", "llm")
         prompt = f"""
         Rewrite this forecasting question into 3 precise, factual search queries for news/reports.
         Focus on entities, dates, and measurable outcomes.
@@ -256,10 +191,12 @@ class SpringAdvancedForecastingBot(ForecastBot):
             return question.question_text[:150]
 
     async def _run_tavily_search(self, query: str) -> str:
+        if not self.tavily:
+            return "[Tavily not configured]"
         try:
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
-                None, 
+                None,
                 lambda: self.tavily.search(query=query, search_depth="advanced", max_results=5)
             )
             context = "\n".join([f"Source: {r['url']}\nContent: {r['content']}" for r in response.get('results', [])])
@@ -274,6 +211,8 @@ class SpringAdvancedForecastingBot(ForecastBot):
         return await self.exa_searcher.search(query, num_results=5)
 
     async def _run_asknews_search(self, query: str) -> str:
+        if not self.asknews_client_id or not self.asknews_client_secret:
+            return "[AskNews not configured]"
         try:
             searcher = AskNewsSearcher(
                 client_id=self.asknews_client_id,
@@ -286,40 +225,78 @@ class SpringAdvancedForecastingBot(ForecastBot):
             return "[AskNews search failed]"
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._concurrency_limiter:
-            optimized_query = await self._optimize_search_query(question)
-            
-            tasks = [
-                self._run_tavily_search(optimized_query),
-                self._run_exa_search(optimized_query),
-                self._run_asknews_search(optimized_query)
-            ]
-            try:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                cleaned = []
-                for res in results:
-                    if isinstance(res, Exception):
-                        cleaned.append(f"[Search failed: {str(res)}]")
-                    else:
-                        cleaned.append(res)
-                combined = "\n\n".join(cleaned)
-                
-                base_rate = ForecastingPrinciples.get_base_rate(question.question_text)
-                fermi = ForecastingPrinciples.get_fermi_decomposition(question.question_text)
-                
-                enhanced_research = f"""{base_rate}
+        optimized_query = await self._optimize_search_query(question)
+
+        tasks = [
+            self._run_tavily_search(optimized_query),
+            self._run_exa_search(optimized_query),
+            self._run_asknews_search(optimized_query)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        cleaned = []
+        for res in results:
+            if isinstance(res, Exception):
+                cleaned.append(f"[Search failed: {str(res)}]")
+            else:
+                cleaned.append(res)
+        combined = "\n\n".join(cleaned)
+
+        # Use only GENERIC, domain-agnostic guidance
+        base_rate = ForecastingPrinciples.get_generic_base_rate()
+        fermi = ForecastingPrinciples.get_generic_fermi_prompt()
+
+        enhanced_research = f"""{base_rate}
 
 {fermi}
 
 {combined}"""
-                return enhanced_research
-            except Exception as e:
-                logger.error(f"Research failure: {e}")
-                return "Research partially failed."
+        return enhanced_research
+
+    def _get_temperature(self, question: MetaculusQuestion) -> float:
+        if not question.close_time:
+            return 0.4
+        days_to_close = (question.close_time - datetime.now(timezone.utc)).days
+        if days_to_close > 180 or "first" in question.question_text.lower() or "never before" in question.question_text.lower():
+            return 0.4
+        else:
+            return 0.1
+
+    async def _get_model_forecast(self, model_name: str, question: MetaculusQuestion, research: str) -> Any:
+        temp = self._get_temperature(question)
+        llm = GeneralLlm(model=model_name, temperature=temp)
+
+        if isinstance(question, BinaryQuestion):
+            schema_example = '{"prediction_in_decimal": 0.35}'
+            out_type = BinaryPrediction
+        elif isinstance(question, MultipleChoiceQuestion):
+            example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
+            schema_example = json.dumps({"predicted_options": example_opts})
+            out_type = PredictedOptionList
+        else:
+            schema_example = '[{"percentile": 10, "value": 100}, {"percentile": 50, "value": 200}, {"percentile": 90, "value": 500}]'
+            out_type = list[Percentile]
+
+        prompt = clean_indents(f"""
+            Question: {question.question_text}
+            Research: {research}
+
+            Apply forecasting best practices:
+            - Start from general priors
+            - Decompose complex problems
+            - Avoid over-updating on recent news
+            - Favor structural stability
+            - Quantify uncertainty
+
+            OUTPUT ONLY VALID JSON:
+            {schema_example}
+        """)
+
+        raw = await llm.invoke(prompt)
+        return await structure_output(sanitize_llm_json(raw), out_type, model=self.get_llm("parser", "llm"))
 
     async def _red_team_forecast(self, question: MetaculusQuestion, research: str, initial_pred: float) -> float:
         try:
-            llm = GeneralLlm(model=self.red_team_model, temperature=0.7)
+            llm = self.get_llm("red_team", "llm") or self.get_llm("default", "llm")
             prompt = clean_indents(f"""
                 You are a skeptical red teamer challenging this forecast: {initial_pred:.2%}.
                 Question: {question.question_text}
@@ -338,11 +315,11 @@ class SpringAdvancedForecastingBot(ForecastBot):
 
     async def _verify_claims(self, draft_reasoning: str, research: str) -> str:
         try:
-            llm = GeneralLlm(model=self.query_optimizer_model, temperature=0.0)
+            llm = self.get_llm("parser", "llm")
             extract_prompt = f"List up to 3 key factual claims in this reasoning:\n{draft_reasoning}"
             claims_response = await llm.invoke(extract_prompt)
             claims = [c.strip() for c in claims_response.split("\n") if c.strip()][:3]
-            
+
             verified = []
             for claim in claims:
                 verification = await self._run_tavily_search(f"Verify: {claim}")
@@ -352,23 +329,14 @@ class SpringAdvancedForecastingBot(ForecastBot):
             logger.warning(f"Claim verification failed: {e}")
             return ""
 
-    def _get_temperature(self, question: MetaculusQuestion) -> float:
-        if not question.close_time:
-            return 0.4
-        days_to_close = (question.close_time - datetime.now(timezone.utc)).days
-        if days_to_close > 180 or "first" in question.question_text.lower() or "never before" in question.question_text.lower():
-            return 0.4
-        else:
-            return 0.1
-
     async def _check_consistency(self, question: MetaculusQuestion, proposed_pred: float) -> bool:
         if len(self._recent_predictions) < 2:
             return True
         recent_summary = "\n".join([
-            f"Q: {q.text} → Pred: {p:.2%}" 
+            f"Q: {q.text} → Pred: {p:.2%}"
             for q, p in self._recent_predictions[-3:]
         ])
-        llm = GeneralLlm(model=self.query_optimizer_model, temperature=0.0)
+        llm = self.get_llm("parser", "llm")
         prompt = f"""
         Is this new forecast logically consistent with prior forecasts?
         New: {question.question_text} → {proposed_pred:.2%}
@@ -381,95 +349,51 @@ class SpringAdvancedForecastingBot(ForecastBot):
         except:
             return True
 
-    async def _run_critic_layer(self, question: MetaculusQuestion, research: str, forecasts: Dict[str, Any]) -> Any:
-        llm = GeneralLlm(model=self.critic_model, temperature=0.0)
-        
-        if isinstance(question, BinaryQuestion):
-            schema_example = '{"prediction_in_decimal": 0.75}'
-            out_type = BinaryPrediction
-        elif isinstance(question, MultipleChoiceQuestion):
-            example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
-            schema_example = json.dumps({"predicted_options": example_opts})
-            out_type = PredictedOptionList
-        else:
-            schema_example = '[{"percentile": 10, "value": 5}, {"percentile": 50, "value": 10}, {"percentile": 90, "value": 20}]'
-            out_type = list[Percentile]
+    async def _run_forecast_on_binary(
+        self, question: BinaryQuestion, research: str
+    ) -> ReasonedPrediction[float]:
+        forecasters = [
+            "openrouter/openai/gpt-5.1",
+            "openrouter/openai/gpt-5",
+            "openrouter/anthropic/claude-4.5-sonnet"
+        ]
 
+        tasks = [self._get_model_forecast(m, question, research) for m in forecasters]
+        results = await asyncio.gather(*tasks)
+        forecast_map = {f"model_{i}": (r.prediction_in_decimal if r else 0.5) for i, r in enumerate(results)}
+
+        critic_llm = self.get_llm("critic", "llm") or self.get_llm("default", "llm")
+        schema_example = '{"prediction_in_decimal": 0.75}'
         prompt = clean_indents(f"""
             Question: {question.question_text}
             Research: {research}
-            Ensemble Forecasts: {json.dumps(forecasts)}
+            Ensemble Forecasts: {json.dumps(forecast_map)}
 
             Apply forecasting best practices:
-            - Start from base rates
+            - Start from general priors
             - Decompose complex problems
             - Avoid recency/salience bias
             - Favor structural stability
-            - Ensure logical consistency with known facts
+            - Ensure logical consistency
 
             OUTPUT ONLY VALID JSON:
             {schema_example}
         """)
-        
-        critique = await llm.invoke(prompt)
-        self._last_critique = critique
-        return await structure_output(sanitize_llm_json(critique), out_type, model=self.get_llm("parser", "llm"))
-
-    async def _get_model_forecast(self, model_id: str, question: MetaculusQuestion, research: str) -> Any:
-        temp = self._get_temperature(question)
-        llm = GeneralLlm(model=model_id, temperature=temp)
-        
-        if isinstance(question, BinaryQuestion):
-            schema_example = '{"prediction_in_decimal": 0.35}'
-            out_type = BinaryPrediction
-        elif isinstance(question, MultipleChoiceQuestion):
-            example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
-            schema_example = json.dumps({"predicted_options": example_opts})
-            out_type = PredictedOptionList
-        else:
-            schema_example = '[{"percentile": 10, "value": 100}, {"percentile": 50, "value": 200}, {"percentile": 90, "value": 500}]'
-            out_type = list[Percentile]
-
-        prompt = clean_indents(f"""
-            Question: {question.question_text}
-            Research: {research}
-
-            Apply forecasting best practices:
-            - Anchor to base rates
-            - Use Fermi decomposition if applicable
-            - Avoid over-updating on recent news
-            - Favor structural stability
-
-            OUTPUT ONLY VALID JSON:
-            {schema_example}
-        """)
-        
-        raw = await llm.invoke(prompt)
-        return await structure_output(sanitize_llm_json(raw), out_type, model=self.get_llm("parser", "llm"))
-
-    async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
-        tasks = [self._get_model_forecast(m, question, research) for m in self.forecasters.values()]
-        results = await asyncio.gather(*tasks)
-        forecast_map = {n: (r.prediction_in_decimal if r else 0.5) for n, r in zip(self.forecasters.keys(), results)}
-        
-        critic_out = await self._run_critic_layer(question, research, forecast_map)
+        critique = await critic_llm.invoke(prompt)
+        critic_out = await structure_output(sanitize_llm_json(critique), BinaryPrediction, model=self.get_llm("parser", "llm"))
         raw_p = critic_out.prediction_in_decimal
-        
-        # Red teaming
+
         red_teamed_p = await self._red_team_forecast(question, research, raw_p)
         averaged_p = (raw_p + red_teamed_p) / 2.0
-        
-        # Claim verification
-        verification = await self._verify_claims(self._last_critique, research)
+
+        verification = await self._verify_claims(critique, research)
         if verification:
             research += f"\n\n[VERIFICATION]\n{verification}"
-        
-        # Consistency check
+
         if not await self._check_consistency(question, averaged_p):
             logger.warning("Inconsistency detected; pulling toward 50%")
             averaged_p = 0.5 * averaged_p + 0.5 * 0.5
-        
-        # Blend with community
+
         community = getattr(question, 'community_prediction', None)
         research_quality = 0.8 if "[Search failed]" not in research else 0.3
         if community is not None:
@@ -477,39 +401,49 @@ class SpringAdvancedForecastingBot(ForecastBot):
         else:
             blended_p = averaged_p
 
-        # Time decay & calibration
         final_p = ForecastingPrinciples.apply_time_decay(blended_p, question.close_time)
         final_p = self.apply_bayesian_calibration(final_p * 100) / 100.0
-        
-        if any(x in research.lower() for x in ["out of reach", "impossible", "unprecedented"]):
-            final_p = min(final_p, 0.015)
-            
-        # Store for consistency
+
+        # Only extreme language triggers override (still domain-agnostic)
+        if any(x in research.lower() for x in ["physically impossible", "logically impossible", "violates known laws"]):
+            final_p = min(final_p, 0.01)
+
         self._recent_predictions.append((question, final_p))
-        
-        comment = f"### Ensemble Analysis\n**Models:** {forecast_map}\n**Critic:** {self._last_critique[:1000]}..."
-        
-        self._save_evaluation_log(
-            question=question,
-            research=research,
-            forecasts=forecast_map,
-            critic_output=self._last_critique,
-            final_prediction=final_p,
-            prediction_type="binary"
-        )
-        
+        comment = f"### Ensemble Analysis\n**Models:** {forecast_map}\n**Critic:** {critique[:1000]}..."
+
         return ReasonedPrediction(prediction_value=final_p, reasoning=comment)
 
-    async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
-        tasks = [self._get_model_forecast(m, question, research) for m in self.forecasters.values()]
+    async def _run_forecast_on_multiple_choice(
+        self, question: MultipleChoiceQuestion, research: str
+    ) -> ReasonedPrediction[PredictedOptionList]:
+        forecasters = [
+            "openrouter/openai/gpt-5.1",
+            "openrouter/openai/gpt-5",
+            "openrouter/anthropic/claude-4.5-sonnet"
+        ]
+        tasks = [self._get_model_forecast(m, question, research) for m in forecasters]
         results = await asyncio.gather(*tasks)
-        forecast_map = {n: (r.model_dump() if r else {}) for n, r in zip(self.forecasters.keys(), results)}
-        
-        final_list: PredictedOptionList = await self._run_critic_layer(question, research, forecast_map)
+        forecast_map = {f"model_{i}": (r.model_dump() if r else {}) for i, r in enumerate(results)}
+
+        critic_llm = self.get_llm("critic", "llm") or self.get_llm("default", "llm")
+        example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
+        schema_example = json.dumps({"predicted_options": example_opts})
+        prompt = clean_indents(f"""
+            Question: {question.question_text}
+            Research: {research}
+            Ensemble Forecasts: {json.dumps(forecast_map)}
+
+            Apply forecasting best practices...
+
+            OUTPUT ONLY VALID JSON:
+            {schema_example}
+        """)
+        critique = await critic_llm.invoke(prompt)
+        final_list: PredictedOptionList = await structure_output(sanitize_llm_json(critique), PredictedOptionList, model=self.get_llm("parser", "llm"))
+
         option_names = question.options
         current_options = {o.option_name: o.probability for o in final_list.predicted_options}
         aligned_options = [{"option_name": name, "probability": current_options.get(name, 0.0)} for name in option_names]
-        
         total = sum(o["probability"] for o in aligned_options)
         if total == 0:
             uniform_p = 1.0 / len(aligned_options)
@@ -518,114 +452,102 @@ class SpringAdvancedForecastingBot(ForecastBot):
         else:
             for o in aligned_options:
                 o["probability"] /= total
-        
+
         final_val = safe_model(PredictedOptionList, {"predicted_options": aligned_options})
-        
-        # Store for consistency tracking (simplified)
         avg_prob = np.mean([opt["probability"] for opt in aligned_options])
         self._recent_predictions.append((question, avg_prob))
-        
-        self._save_evaluation_log(
-            question=question,
-            research=research,
-            forecasts=forecast_map,
-            critic_output=self._last_critique,
-            final_prediction={opt["option_name"]: opt["probability"] for opt in aligned_options},
-            prediction_type="multiple_choice"
-        )
-        
-        return ReasonedPrediction(prediction_value=final_val, reasoning=f"### MCQ Synthesis\n{self._last_critique[:1000]}")
 
-    async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
-        tasks = [self._get_model_forecast(m, question, research) for m in self.forecasters.values()]
+        return ReasonedPrediction(prediction_value=final_val, reasoning=f"### MCQ Synthesis\n{critique[:1000]}")
+
+    async def _run_forecast_on_numeric(
+        self, question: NumericQuestion, research: str
+    ) -> ReasonedPrediction[NumericDistribution]:
+        forecasters = [
+            "openrouter/openai/gpt-5.1",
+            "openrouter/openai/gpt-5",
+            "openrouter/anthropic/claude-4.5-sonnet"
+        ]
+        tasks = [self._get_model_forecast(m, question, research) for m in forecasters]
         results = await asyncio.gather(*tasks)
-        forecast_map = {n: ([p.model_dump() for p in r] if r else []) for n, r in zip(self.forecasters.keys(), results)}
-        
-        final_pcts: list[Percentile] = await self._run_critic_layer(question, research, forecast_map)
+        forecast_map = {f"model_{i}": ([p.model_dump() for p in r] if r else []) for i, r in enumerate(results)}
+
+        critic_llm = self.get_llm("critic", "llm") or self.get_llm("default", "llm")
+        schema_example = '[{"percentile": 10, "value": 100}, {"percentile": 50, "value": 200}, {"percentile": 90, "value": 500}]'
+        prompt = clean_indents(f"""
+            Question: {question.question_text}
+            Research: {research}
+            Ensemble Forecasts: {json.dumps(forecast_map)}
+
+            Apply forecasting best practices...
+
+            OUTPUT ONLY VALID JSON:
+            {schema_example}
+        """)
+        critique = await critic_llm.invoke(prompt)
+        final_pcts: list[Percentile] = await structure_output(sanitize_llm_json(critique), list[Percentile], model=self.get_llm("parser", "llm"))
         final_pcts.sort(key=lambda x: x.percentile)
-        
         for i in range(1, len(final_pcts)):
             if final_pcts[i].value <= final_pcts[i-1].value:
                 final_pcts[i].value = final_pcts[i-1].value + 1e-6
-        
-        dist = NumericDistribution.from_question(final_pcts, question)
-        
-        # Store representative value (median) for consistency
-        median_val = next((p.value for p in final_pcts if p.percentile == 50), 0.0)
-        self._recent_predictions.append((question, median_val / (median_val + 1)))  # normalize to [0,1]
-        
-        self._save_evaluation_log(
-            question=question,
-            research=research,
-            forecasts=forecast_map,
-            critic_output=self._last_critique,
-            final_prediction=[p.model_dump() for p in final_pcts],
-            prediction_type="numeric"
-        )
-        
-        return ReasonedPrediction(prediction_value=dist, reasoning=f"### Numeric Synthesis\n{self._last_critique[:1000]}")
 
-    def _save_evaluation_log(
-        self,
-        question: MetaculusQuestion,
-        research: str,
-        forecasts: Dict,
-        critic_output: str,
-        final_prediction: Any,
-        prediction_type: str
-    ):
-        log_entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "question": {
-                "id": question.id,
-                "url": f"https://www.metaculus.com/questions/{question.id}",
-                "text": question.question_text,
-                "type": prediction_type,
-                "community_prediction": getattr(question, 'community_prediction', None),
-                "resolution_criteria": getattr(question, 'resolution_criteria', None),
-                "publish_time": getattr(question, 'publish_time', None),
-                "close_time": getattr(question, 'close_time', None),
-            },
-            "research": research,
-            "forecasts": forecasts,
-            "critic_output": critic_output,
-            "final_prediction": final_prediction,
-            "bot_config": {
-                "dynamic_queries": True,
-                "uncertainty_aware": True,
-                "consistency_checks": True,
-                "adaptive_temp": True,
-                "claim_verification": True,
-                "forecasters": list(self.forecasters.keys()),
-                "critic_model": self.critic_model
-            }
-        }
-        log_path = LOGS_DIR / f"q{question.id}_{int(time.time())}.json"
-        with open(log_path, "w") as f:
-            json.dump(log_entry, f, indent=2, default=str)
-        logger.info(f"✅ Saved evaluation log to {log_path}")
+        dist = NumericDistribution.from_question(final_pcts, question)
+        median_val = next((p.value for p in final_pcts if p.percentile == 50), 0.0)
+        self._recent_predictions.append((question, median_val / (median_val + 1)))
+
+        return ReasonedPrediction(prediction_value=dist, reasoning=f"### Numeric Synthesis\n{critique[:1000]}")
 
 # ==========================================
 # 🚀 MAIN EXECUTION
 # ==========================================
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(description="Run the General-Purpose Advanced Forecasting Bot")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["tournament", "metaculus_cup", "test_questions"],
+        default="tournament",
+        help="Specify the run mode (default: tournament)",
+    )
+    args = parser.parse_args()
+    run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
+
     bot = SpringAdvancedForecastingBot(
+        research_reports_per_question=1,
+        predictions_per_research_report=1,
+        use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
+        skip_previously_forecasted_questions=True,
+        extra_metadata_in_explanation=True,
         llms={
-            "researcher": "smart-searcher/openrouter/openai/gpt-4o",
+            "default": "openrouter/openai/gpt-5",
             "parser": "openrouter/openai/gpt-4o-mini",
+            "query_optimizer": "openrouter/openai/gpt-4o-mini",
+            "critic": "openrouter/openai/gpt-5",
+            "red_team": "openrouter/openai/gpt-4o",
         }
     )
 
-    TARGETS = ["32916", "minibench"]
+    client = MetaculusClient()
+    if run_mode == "tournament":
+        seasonal = asyncio.run(bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
+        minibench = asyncio.run(bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
+        reports = seasonal + minibench
+    elif run_mode == "metaculus_cup":
+        bot.skip_previously_forecasted_questions = False
+        reports = asyncio.run(bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
+    elif run_mode == "test_questions":
+        EXAMPLE_QUESTIONS = [
+            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
+        ]
+        bot.skip_previously_forecasted_questions = False
+        questions = [client.get_question_by_url(url.strip()) for url in EXAMPLE_QUESTIONS]
+        reports = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
 
-    async def run():
-        for tid in TARGETS:
-            logger.info(f"▶ Tournament: {tid}")
-            try:
-                await bot.forecast_on_tournament(tid, return_exceptions=True)
-            except Exception as e:
-                logger.error(f"Error in {tid}: {e}")
-
-    asyncio.run(run())
+    bot.log_report_summary(reports)
