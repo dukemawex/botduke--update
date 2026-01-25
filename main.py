@@ -63,7 +63,7 @@ def sanitize_llm_json(text: str) -> str:
         text = text[:-3]
     return text.strip()
 
-def safe_model(model_cls: type[BaseModel], data: Any) -> BaseModel:
+def safe_model(model_cls: type[BaseModel],  Any) -> BaseModel:
     try:
         if isinstance(data, model_cls):
             return data
@@ -161,11 +161,25 @@ class SpringAdvancedForecastingBot(ForecastBot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        # Initialize external clients only if keys are present
         self.tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY")) if os.getenv("TAVILY_API_KEY") else None
         self.exa_searcher = ExaSearcher() if os.getenv("EXA_API_KEY") else None
         self.asknews_client_id = os.getenv("ASKNEWS_CLIENT_ID")
         self.asknews_client_secret = os.getenv("ASKNEWS_CLIENT_SECRET")
         self._recent_predictions = []
+
+    @property
+    def _llm_config_defaults(self) -> Dict[str, str]:
+        """Define default models for all custom LLM roles to eliminate warnings."""
+        return {
+            "default": "openrouter/openai/gpt-5",
+            "parser": "openrouter/openai/gpt-4o-mini",
+            "summarizer": "openrouter/openai/gpt-4o-mini",
+            "researcher": "openrouter/openai/gpt-4o-search-preview",  # Note: overridden by custom run_research
+            "query_optimizer": "openrouter/openai/gpt-4o-mini",
+            "critic": "openrouter/openai/gpt-5",
+            "red_team": "openrouter/openai/gpt-4o",
+        }
 
     def apply_bayesian_calibration(self, estimate_pct: float) -> float:
         p = np.clip(estimate_pct / 100.0, 0.005, 0.995)
@@ -176,7 +190,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         return round(float(np.clip(adjusted_p * 100, 1.0, 99.0)), 2)
 
     async def _optimize_search_query(self, question: MetaculusQuestion) -> str:
-        llm = self.get_llm("query_optimizer", "llm") or self.get_llm("parser", "llm")
+        llm = self.get_llm("query_optimizer", "llm")
         prompt = f"""
         Rewrite this forecasting question into 3 precise, factual search queries for news/reports.
         Focus on entities, dates, and measurable outcomes.
@@ -241,7 +255,6 @@ class SpringAdvancedForecastingBot(ForecastBot):
                 cleaned.append(res)
         combined = "\n\n".join(cleaned)
 
-        # Use only GENERIC, domain-agnostic guidance
         base_rate = ForecastingPrinciples.get_generic_base_rate()
         fermi = ForecastingPrinciples.get_generic_fermi_prompt()
 
@@ -296,7 +309,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
 
     async def _red_team_forecast(self, question: MetaculusQuestion, research: str, initial_pred: float) -> float:
         try:
-            llm = self.get_llm("red_team", "llm") or self.get_llm("default", "llm")
+            llm = self.get_llm("red_team", "llm")
             prompt = clean_indents(f"""
                 You are a skeptical red teamer challenging this forecast: {initial_pred:.2%}.
                 Question: {question.question_text}
@@ -362,7 +375,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         results = await asyncio.gather(*tasks)
         forecast_map = {f"model_{i}": (r.prediction_in_decimal if r else 0.5) for i, r in enumerate(results)}
 
-        critic_llm = self.get_llm("critic", "llm") or self.get_llm("default", "llm")
+        critic_llm = self.get_llm("critic", "llm")
         schema_example = '{"prediction_in_decimal": 0.75}'
         prompt = clean_indents(f"""
             Question: {question.question_text}
@@ -404,7 +417,6 @@ class SpringAdvancedForecastingBot(ForecastBot):
         final_p = ForecastingPrinciples.apply_time_decay(blended_p, question.close_time)
         final_p = self.apply_bayesian_calibration(final_p * 100) / 100.0
 
-        # Only extreme language triggers override (still domain-agnostic)
         if any(x in research.lower() for x in ["physically impossible", "logically impossible", "violates known laws"]):
             final_p = min(final_p, 0.01)
 
@@ -425,7 +437,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         results = await asyncio.gather(*tasks)
         forecast_map = {f"model_{i}": (r.model_dump() if r else {}) for i, r in enumerate(results)}
 
-        critic_llm = self.get_llm("critic", "llm") or self.get_llm("default", "llm")
+        critic_llm = self.get_llm("critic", "llm")
         example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
         schema_example = json.dumps({"predicted_options": example_opts})
         prompt = clean_indents(f"""
@@ -471,7 +483,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         results = await asyncio.gather(*tasks)
         forecast_map = {f"model_{i}": ([p.model_dump() for p in r] if r else []) for i, r in enumerate(results)}
 
-        critic_llm = self.get_llm("critic", "llm") or self.get_llm("default", "llm")
+        critic_llm = self.get_llm("critic", "llm")
         schema_example = '[{"percentile": 10, "value": 100}, {"percentile": 50, "value": 200}, {"percentile": 90, "value": 500}]'
         prompt = clean_indents(f"""
             Question: {question.question_text}
@@ -524,13 +536,7 @@ if __name__ == "__main__":
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        llms={
-            "default": "openrouter/openai/gpt-5",
-            "parser": "openrouter/openai/gpt-4o-mini",
-            "query_optimizer": "openrouter/openai/gpt-4o-mini",
-            "critic": "openrouter/openai/gpt-5",
-            "red_team": "openrouter/openai/gpt-4o",
-        }
+        # llms={}  # Optional: override defaults if needed
     )
 
     client = MetaculusClient()
