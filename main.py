@@ -42,6 +42,7 @@ from forecasting_tools import (
     structure_output,
 )
 
+# Load environment variables
 dotenv.load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -50,7 +51,7 @@ LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 
 # ==========================================
-# 🛡️ UTILITIES
+# 🛡️ DATA SANITIZATION UTILITIES
 # ==========================================
 
 def sanitize_llm_json(text: str) -> str:
@@ -69,7 +70,7 @@ def sanitize_llm_json(text: str) -> str:
 
 T = TypeVar("T", bound=BaseModel)
 
-def safe_model(model_cls: Type[T],  Any) -> T:
+def safe_model(model_cls: Type[T], data: Any) -> T:
     try:
         if isinstance(data, model_cls): 
             return data
@@ -84,19 +85,28 @@ def safe_model(model_cls: Type[T],  Any) -> T:
         raise
 
 # ==========================================
-# 🔍 EXA CLIENT
+# 🔍 EXA SEARCH CLIENT
 # ==========================================
 
 class ExaSearcher:
     def __init__(self):
         self.api_key = os.getenv("EXA_API_KEY")
         if not self.api_key:
-            raise ValueError("EXA_API_KEY is required.")
+            raise ValueError("EXA_API_KEY is required for Exa search.")
         self.base_url = "https://api.exa.ai/search"
 
     async def search(self, query: str, num_results: int = 5) -> str:
-        headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
-        payload = {"query": query, "numResults": num_results, "type": "neural", "useAutoprompt": True, "category": "news"}
+        headers = {
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "query": query,
+            "numResults": num_results,
+            "type": "neural",
+            "useAutoprompt": True,
+            "category": "news"
+        }
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(self.base_url, json=payload, headers=headers)
@@ -121,9 +131,9 @@ class ForecastingPrinciples:
     @staticmethod
     def get_base_rate(question_text: str) -> str:
         qt = question_text.lower()
-        if any(kw in qt for kw in ["election", "win", "president"]) and "female" in qt:
+        if any(kw in qt for kw in ["election", "win", "president", "prime minister"]) and "female" in qt:
             return "BASE RATE: Only ~12% of non-incumbent female candidates win national executive elections in runoff systems (1990–2025)."
-        elif "ai" in qt and ("by 2030" in qt or "by 2026" in qt):
+        elif "ai" in qt and ("by 2030" in qt or "by 2026" in qt or "by 2027" in qt):
             return "BASE RATE: ~78% of AI milestone predictions on Metaculus >3 years out resolve 'no'."
         elif "default" in qt and ("country" in qt or "nation" in qt):
             return "BASE RATE: Sovereign defaults occur in ~2.5% of country-years; higher in emerging markets (~5%)."
@@ -182,7 +192,7 @@ Final ≈ P1 × P2 × P3 × P4
             return prob
 
 # ==========================================
-# 🤖 COMPETITION-GRADE BOT
+# 🤖 COMPETITION-GRADE FORECASTING BOT
 # ==========================================
 
 class SpringAdvancedForecastingBot(ForecastBot):
@@ -209,6 +219,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         self.asknews_client_id = os.getenv("ASKNEWS_CLIENT_ID")
         self.asknews_client_secret = os.getenv("ASKNEWS_CLIENT_SECRET")
         
+        # Preserve your model names exactly
         self.forecasters = {
             "gpt-5.1": "openrouter/openai/gpt-5.1",
             "gpt-5": "openrouter/openai/gpt-5",
@@ -368,7 +379,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
             response = await llm.invoke(prompt)
             return "YES" in response.upper()
         except:
-            return True  # Default to consistent
+            return True
 
     async def _run_critic_layer(self, question: MetaculusQuestion, research: str, forecasts: Dict[str, Any]) -> Any:
         llm = GeneralLlm(model=self.critic_model, temperature=0.0)
@@ -489,9 +500,80 @@ class SpringAdvancedForecastingBot(ForecastBot):
         
         return ReasonedPrediction(prediction_value=final_p, reasoning=comment)
 
-    # ... (MCQ and Numeric methods remain similar — omitted for brevity but follow same pattern)
+    async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
+        tasks = [self._get_model_forecast(m, question, research) for m in self.forecasters.values()]
+        results = await asyncio.gather(*tasks)
+        forecast_map = {n: (r.model_dump() if r else {}) for n, r in zip(self.forecasters.keys(), results)}
+        
+        final_list: PredictedOptionList = await self._run_critic_layer(question, research, forecast_map)
+        option_names = question.options
+        current_options = {o.option_name: o.probability for o in final_list.predicted_options}
+        aligned_options = [{"option_name": name, "probability": current_options.get(name, 0.0)} for name in option_names]
+        
+        total = sum(o["probability"] for o in aligned_options)
+        if total == 0:
+            uniform_p = 1.0 / len(aligned_options)
+            for o in aligned_options:
+                o["probability"] = uniform_p
+        else:
+            for o in aligned_options:
+                o["probability"] /= total
+        
+        final_val = safe_model(PredictedOptionList, {"predicted_options": aligned_options})
+        
+        # Store for consistency tracking (simplified)
+        avg_prob = np.mean([opt["probability"] for opt in aligned_options])
+        self._recent_predictions.append((question, avg_prob))
+        
+        self._save_evaluation_log(
+            question=question,
+            research=research,
+            forecasts=forecast_map,
+            critic_output=self._last_critique,
+            final_prediction={opt["option_name"]: opt["probability"] for opt in aligned_options},
+            prediction_type="multiple_choice"
+        )
+        
+        return ReasonedPrediction(prediction_value=final_val, reasoning=f"### MCQ Synthesis\n{self._last_critique[:1000]}")
 
-    def _save_evaluation_log(self, question, research, forecasts, critic_output, final_prediction, prediction_type):
+    async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
+        tasks = [self._get_model_forecast(m, question, research) for m in self.forecasters.values()]
+        results = await asyncio.gather(*tasks)
+        forecast_map = {n: ([p.model_dump() for p in r] if r else []) for n, r in zip(self.forecasters.keys(), results)}
+        
+        final_pcts: list[Percentile] = await self._run_critic_layer(question, research, forecast_map)
+        final_pcts.sort(key=lambda x: x.percentile)
+        
+        for i in range(1, len(final_pcts)):
+            if final_pcts[i].value <= final_pcts[i-1].value:
+                final_pcts[i].value = final_pcts[i-1].value + 1e-6
+        
+        dist = NumericDistribution.from_question(final_pcts, question)
+        
+        # Store representative value (median) for consistency
+        median_val = next((p.value for p in final_pcts if p.percentile == 50), 0.0)
+        self._recent_predictions.append((question, median_val / (median_val + 1)))  # normalize to [0,1]
+        
+        self._save_evaluation_log(
+            question=question,
+            research=research,
+            forecasts=forecast_map,
+            critic_output=self._last_critique,
+            final_prediction=[p.model_dump() for p in final_pcts],
+            prediction_type="numeric"
+        )
+        
+        return ReasonedPrediction(prediction_value=dist, reasoning=f"### Numeric Synthesis\n{self._last_critique[:1000]}")
+
+    def _save_evaluation_log(
+        self,
+        question: MetaculusQuestion,
+        research: str,
+        forecasts: Dict,
+        critic_output: str,
+        final_prediction: Any,
+        prediction_type: str
+    ):
         log_entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "question": {
@@ -500,6 +582,8 @@ class SpringAdvancedForecastingBot(ForecastBot):
                 "text": question.question_text,
                 "type": prediction_type,
                 "community_prediction": getattr(question, 'community_prediction', None),
+                "resolution_criteria": getattr(question, 'resolution_criteria', None),
+                "publish_time": getattr(question, 'publish_time', None),
                 "close_time": getattr(question, 'close_time', None),
             },
             "research": research,
@@ -511,7 +595,9 @@ class SpringAdvancedForecastingBot(ForecastBot):
                 "uncertainty_aware": True,
                 "consistency_checks": True,
                 "adaptive_temp": True,
-                "claim_verification": True
+                "claim_verification": True,
+                "forecasters": list(self.forecasters.keys()),
+                "critic_model": self.critic_model
             }
         }
         log_path = LOGS_DIR / f"q{question.id}_{int(time.time())}.json"
@@ -520,7 +606,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         logger.info(f"✅ Saved evaluation log to {log_path}")
 
 # ==========================================
-# 🚀 MAIN
+# 🚀 MAIN EXECUTION
 # ==========================================
 
 if __name__ == "__main__":
