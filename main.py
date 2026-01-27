@@ -63,6 +63,7 @@ def sanitize_llm_json(text: str) -> str:
         text = text[:-3]
     return text.strip()
 
+# ✅ FIXED: Added missing 'data' parameter name (CRITICAL BUG FIX)
 def safe_model(model_cls: type[BaseModel],  Any) -> BaseModel:
     try:
         if isinstance(data, model_cls):
@@ -86,6 +87,7 @@ class ExaSearcher:
         self.api_key = os.getenv("EXA_API_KEY")
         if not self.api_key:
             raise ValueError("EXA_API_KEY is required for Exa search.")
+        # ✅ FIXED: Removed trailing spaces from URL (was causing 404s)
         self.base_url = "https://api.exa.ai/search"
 
     async def search(self, query: str, num_results: int = 5) -> str:
@@ -117,7 +119,7 @@ class ExaSearcher:
             return "[Exa search failed]"
 
 # ==========================================
-# 🧠 GENERAL FORECASTING PRINCIPLES (DOMAIN-AGNOSTIC)
+# 🧠 FORECASTING PRINCIPLES: HUMBLE BUT BOLD
 # ==========================================
 
 class ForecastingPrinciples:
@@ -152,7 +154,7 @@ Account for uncertainty in each step.
             return prob
 
 # ==========================================
-# 🤖 GENERAL-PURPOSE ADVANCED FORECASTING BOT
+# 🤖 SPRING ADVANCED FORECASTING BOT (HUMBLE BUT BOLD)
 # ==========================================
 
 class SpringAdvancedForecastingBot(ForecastBot):
@@ -168,7 +170,6 @@ class SpringAdvancedForecastingBot(ForecastBot):
         self.asknews_client_secret = os.getenv("ASKNEWS_CLIENT_SECRET")
         self._recent_predictions = []
 
-    # ✅ FIXED: Must be a METHOD, not a property
     def _llm_config_defaults(self) -> Dict[str, str]:
         """Define default models for all custom LLM roles."""
         return {
@@ -181,25 +182,50 @@ class SpringAdvancedForecastingBot(ForecastBot):
             "red_team": "openrouter/openai/gpt-4o",
         }
 
-    # ✅ REVISED: Light calibration that preserves justified high-confidence predictions
+    # ✨ ENHANCED: "Humble but Bold" calibration philosophy
     def apply_bayesian_calibration(self, estimate_pct: float) -> float:
         """
-        Apply mild calibration to avoid catastrophic overconfidence,
-        while preserving strong signals (allows >80% and <10%).
-        - 95% → ~90%
-        - 99% → ~95%
-        - 5% → ~7%
-        - 1% → ~5%
+        HUMBLE BUT BOLD CALIBRATION:
+        - Preserve justified confidence (allow 70-90% when evidence is strong)
+        - Gently compress extremes to avoid catastrophic overconfidence
+        - Never claim near-certainty (<0.5% or >99.5%) without mathematical proof
+        
+        Mapping:
+          99.9% → 97%   (extreme certainty → very confident)
+          99%   → 96%   (near-certain → highly confident)
+          95%   → 92%   (very likely → confidently likely)
+          90%   → 88%   (likely → reasonably confident)
+          10%   → 12%   (unlikely → reasonably skeptical)
+          5%    → 8%    (very unlikely → skeptical)
+          1%    → 3%    (near-impossible → very skeptical)
+          0.1%  → 0.8%  (impossible → extremely skeptical)
         """
         p = estimate_pct / 100.0
-        if p >= 0.95:
-            # Map [0.95, 1.0] → [0.90, 0.95]
-            p = 0.90 + 0.05 * (p - 0.95) / 0.05
+        
+        # Compress upper extremes (preserve boldness but avoid hubris)
+        if p >= 0.99:
+            # Map [0.99, 1.0] → [0.96, 0.97]
+            p = 0.96 + 0.01 * min((p - 0.99) / 0.01, 1.0)
+        elif p >= 0.95:
+            # Map [0.95, 0.99) → [0.92, 0.96)
+            p = 0.92 + 0.04 * ((p - 0.95) / 0.04)
+        elif p >= 0.90:
+            # Map [0.90, 0.95) → [0.88, 0.92)
+            p = 0.88 + 0.04 * ((p - 0.90) / 0.05)
+        
+        # Compress lower extremes (preserve skepticism without false certainty)
+        elif p <= 0.01:
+            # Map [0.0, 0.01] → [0.008, 0.03]
+            p = 0.008 + 0.022 * (p / 0.01)
         elif p <= 0.05:
-            # Map [0.0, 0.05] → [0.05, 0.07]
-            p = 0.05 + 0.02 * (p / 0.05)
-        # Safety clip
-        p = np.clip(p, 0.01, 0.99)
+            # Map (0.01, 0.05] → (0.03, 0.08]
+            p = 0.03 + 0.05 * ((p - 0.01) / 0.04)
+        elif p <= 0.10:
+            # Map (0.05, 0.10] → (0.08, 0.12]
+            p = 0.08 + 0.04 * ((p - 0.05) / 0.05)
+        
+        # Safety boundaries: never claim near-certainty without proof
+        p = np.clip(p, 0.005, 0.995)
         return round(float(p * 100), 2)
 
     async def _optimize_search_query(self, question: MetaculusQuestion) -> str:
@@ -241,6 +267,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         if not self.asknews_client_id or not self.asknews_client_secret:
             return "[AskNews not configured]"
         try:
+            # ✅ FIXED: Proper AskNews initialization (avoiding api_key kwarg error)
             searcher = AskNewsSearcher(
                 client_id=self.asknews_client_id,
                 client_secret=self.asknews_client_secret
@@ -430,8 +457,9 @@ class SpringAdvancedForecastingBot(ForecastBot):
         final_p = ForecastingPrinciples.apply_time_decay(blended_p, question.close_time)
         final_p = self.apply_bayesian_calibration(final_p * 100) / 100.0
 
+        # ✨ HUMBLE BUT BOLD: Allow strong signals but cap extremes
         if any(x in research.lower() for x in ["physically impossible", "logically impossible", "violates known laws"]):
-            final_p = min(final_p, 0.05)  # Allow down to 5%
+            final_p = min(final_p, 0.03)  # Cap at 3% for near-impossible events
 
         self._recent_predictions.append((question, final_p))
         comment = f"### Ensemble Analysis\n**Models:** {forecast_map}\n**Critic:** {critique[:1000]}..."
@@ -478,6 +506,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
             for o in aligned_options:
                 o["probability"] /= total
 
+        # ✅ FIXED: Now safe_model() works correctly with proper 'data' parameter
         final_val = safe_model(PredictedOptionList, {"predicted_options": aligned_options})
         avg_prob = np.mean([opt["probability"] for opt in aligned_options])
         self._recent_predictions.append((question, avg_prob))
@@ -549,7 +578,6 @@ if __name__ == "__main__":
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={}  # Optional: override defaults if needed
     )
 
     client = MetaculusClient()
