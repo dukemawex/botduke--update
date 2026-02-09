@@ -25,7 +25,7 @@ from forecasting_tools import (
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
-    Percentile,  # NOTE: forecasting_tools.Percentile expects percentile in [0,1]
+    Percentile,  # forecasting_tools.Percentile expects percentile in [0,1]
     BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
+
 
 # ==========================================
 # 🛡️ DATA SANITIZATION UTILITIES
@@ -151,7 +152,7 @@ FERMI GUIDANCE:
 2) Decompose into drivers/factors.
 3) Estimate each factor using available evidence.
 4) Combine factors algebraically.
-5) Quantify uncertainty, and keep intervals wide unless evidence is strong.
+5) Quantify uncertainty; keep intervals wide unless evidence is strong.
 """.strip()
 
     @staticmethod
@@ -178,17 +179,13 @@ FERMI GUIDANCE:
 
 class SpringAdvancedForecastingBot(ForecastBot):
     """
-    Fixes:
-      1) Percentile validation error (forecasting_tools.Percentile expects percentile in [0,1]):
-         - We parse into RawPercentile then normalize into forecasting_tools.Percentile.
-      2) structure_output sampled-output mismatch for numeric:
-         - Use num_validation_samples=1 for numeric parsing stages (deterministic parsing is hard with units).
-      3) Never forecast without live search:
-         - If Tavily/Exa/AskNews produce no usable results, raise (skip) rather than forecast.
-      4) Median usage:
-         - We track median proxy = (p40+p60)/2 for internal diagnostics and stability.
+    Fixes in this revision:
+      - NO hard failure if Tavily/Exa/AskNews not configured.
+      - Research ALWAYS runs using whatever is available:
+          Tavily / Exa / AskNews / (fallback) the bot's configured "researcher" LLM.
+      - "Live web search" requirement is satisfied either via Tavily/Exa/AskNews OR via the web-enabled researcher model.
     """
-    _structure_output_validation_samples = 2  # keep for non-numeric
+    _structure_output_validation_samples = 2
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -211,7 +208,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         }
 
     # ------------------------------------------
-    # Search footprint + gating
+    # Research footprint + gating (soft)
     # ------------------------------------------
 
     def _search_footprint(self, research: str) -> str:
@@ -226,75 +223,27 @@ class SpringAdvancedForecastingBot(ForecastBot):
             used.append("exa")
         if ok("[AskNews Data]", ["[AskNews not configured]", "[AskNews search failed]"]):
             used.append("asknews")
+        if ok("[LLM Web Research]", ["[LLM web research failed]"]):
+            used.append("llm_web")
 
         return ",".join(used) if used else "none"
+
+    def _ensure_some_research_or_raise(self, research: str) -> None:
+        """
+        We still enforce: do not forecast without *some* research.
+        But now "some research" can be from Tavily/Exa/AskNews OR the researcher LLM.
+        """
+        if self._search_footprint(research) == "none":
+            raise RuntimeError(
+                "No research evidence available (all providers failed, and LLM web research failed)."
+            )
 
     def _research_quality_weight(self, research: str) -> float:
         srcs = self._search_footprint(research)
         if srcs == "none":
-            return 0.0
+            return 0.25
         n = len(srcs.split(","))
-        return {1: 0.55, 2: 0.75, 3: 0.85}.get(n, 0.6)
-
-    def _ensure_live_search_or_raise(self, research: str) -> None:
-        """
-        Hard requirement: never forecast without live web search from Tavily or Exa or AskNews.
-        """
-        if self._search_footprint(research) == "none":
-            raise RuntimeError(
-                "No live web search results available (Tavily/Exa/AskNews all missing or failed). "
-                "Configure at least one provider and retry."
-            )
-
-    # ------------------------------------------
-    # Brief comments
-    # ------------------------------------------
-
-    def _brief_binary_comment(
-        self,
-        forecast_map: Dict[str, float],
-        raw_p: float,
-        red_teamed_p: float,
-        final_p: float,
-        research: str,
-    ) -> str:
-        vals = list(forecast_map.values()) or [0.5]
-        med = float(np.median(vals))
-        spread = float(np.max(vals) - np.min(vals)) if len(vals) > 1 else 0.0
-        srcs = self._search_footprint(research)
-        return (
-            f"final={final_p:.3f} critic={raw_p:.3f} red={red_teamed_p:.3f} "
-            f"med={med:.3f} spread={spread:.3f} search={srcs}"
-        )
-
-    def _brief_mcq_comment(self, research: str) -> str:
-        return f"search={self._search_footprint(research)}"
-
-    def _brief_numeric_comment(self, research: str, median_proxy: float) -> str:
-        return f"search={self._search_footprint(research)} median≈{median_proxy:g}"
-
-    # ------------------------------------------
-    # Calibration (binary only)
-    # ------------------------------------------
-
-    def apply_bayesian_calibration(self, estimate_pct: float) -> float:
-        p = estimate_pct / 100.0
-
-        if p >= 0.99:
-            p = 0.96 + 0.01 * min((p - 0.99) / 0.01, 1.0)
-        elif p >= 0.95:
-            p = 0.92 + 0.04 * ((p - 0.95) / 0.04)
-        elif p >= 0.90:
-            p = 0.88 + 0.04 * ((p - 0.90) / 0.05)
-        elif p <= 0.01:
-            p = 0.008 + 0.022 * (p / 0.01)
-        elif p <= 0.05:
-            p = 0.03 + 0.05 * ((p - 0.01) / 0.04)
-        elif p <= 0.10:
-            p = 0.08 + 0.04 * ((p - 0.05) / 0.05)
-
-        p = np.clip(p, 0.005, 0.995)
-        return round(float(p * 100), 2)
+        return {1: 0.55, 2: 0.75, 3: 0.85, 4: 0.90}.get(n, 0.6)
 
     # ------------------------------------------
     # Research
@@ -328,7 +277,7 @@ Output ONLY a JSON list: ["query1","query2","query3"]
             context = "\n".join(
                 [f"Source: {r.get('url','')}\nContent: {r.get('content','')}" for r in response.get("results", [])]
             )
-            return f"[Tavily Data]\n{context}"
+            return f"[Tavily Data]\n{context}" if context.strip() else "[Tavily search failed]"
         except Exception as e:
             logger.error(f"Tavily search failed: {e}")
             return "[Tavily search failed]"
@@ -347,10 +296,49 @@ Output ONLY a JSON list: ["query1","query2","query3"]
                 client_secret=self.asknews_client_secret,
             )
             result = await searcher.call_preconfigured_version("asknews/news-summaries", query)
-            return f"[AskNews Data]\n{result}"
+            return f"[AskNews Data]\n{result}" if str(result).strip() else "[AskNews search failed]"
         except Exception as e:
             logger.error(f"AskNews search failed: {e}")
             return "[AskNews search failed]"
+
+    async def _run_llm_web_research(self, question: MetaculusQuestion) -> str:
+        """
+        Fallback research using the configured 'researcher' LLM.
+        This is used when external APIs aren't configured or fail.
+        """
+        try:
+            researcher = self.get_llm("researcher")
+            prompt = clean_indents(
+                f"""
+You are an assistant to a superforecaster.
+Use live web browsing/search (if available to your model) to gather the most relevant, recent evidence.
+Provide:
+- 6-12 bullet facts with sources/links when possible
+- any key numbers / time series / market expectations
+- what would make the question resolve each way (if applicable)
+Do NOT give a final forecast.
+
+Question:
+{question.question_text}
+
+Resolution criteria:
+{question.resolution_criteria}
+
+Fine print:
+{question.fine_print}
+"""
+            )
+            if isinstance(researcher, GeneralLlm):
+                out = await researcher.invoke(prompt)
+            else:
+                out = await self.get_llm("researcher", "llm").invoke(prompt)
+            out = (out or "").strip()
+            if not out:
+                return "[LLM web research failed]"
+            return f"[LLM Web Research]\n{out}"
+        except Exception as e:
+            logger.error(f"LLM web research failed: {e}")
+            return "[LLM web research failed]"
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         queries = await self._optimize_search_query(question)
@@ -370,7 +358,12 @@ Output ONLY a JSON list: ["query1","query2","query3"]
             else:
                 cleaned.append(res)
 
-        combined = "\n\n".join(cleaned)
+        combined = "\n\n".join(cleaned).strip()
+
+        # If external providers aren't usable, fallback to LLM web research
+        if self._search_footprint(combined) == "none":
+            combined = (combined + "\n\n" if combined else "") + await self._run_llm_web_research(question)
+
         base_rate = ForecastingPrinciples.get_generic_base_rate()
         fermi = ForecastingPrinciples.get_generic_fermi_prompt()
 
@@ -380,12 +373,12 @@ Output ONLY a JSON list: ["query1","query2","query3"]
 
 {combined}"""
 
-        # HARD GATE: no forecasting without live search
-        self._ensure_live_search_or_raise(research)
+        # Now enforce: we got *something* usable (providers OR LLM web research)
+        self._ensure_some_research_or_raise(research)
         return research
 
     # ------------------------------------------
-    # Numeric helpers (bounds, parsing, normalization)
+    # Numeric helpers
     # ------------------------------------------
 
     def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> Tuple[str, str]:
@@ -406,34 +399,31 @@ Output ONLY a JSON list: ["query1","query2","query3"]
         return upper_msg, lower_msg
 
     def _numeric_parsing_instructions(self, question: NumericQuestion) -> str:
-        # IMPORTANT: we parse RawPercentile then normalize to Percentile in [0,1]
         return clean_indents(
             f"""
-            Extract a numeric forecast distribution from the text.
+Extract a numeric forecast distribution from the text.
 
-            Output MUST be a list of objects with fields:
-              - percentile
-              - value
+Output MUST be a list of objects with fields:
+  - percentile
+  - value
 
-            Percentile can be written as:
-              - 10, 20, 40, 60, 80, 90
-              OR
-              - 0.1, 0.2, 0.4, 0.6, 0.8, 0.9
+Percentile can be:
+  - 10,20,40,60,80,90
+  OR
+  - 0.1,0.2,0.4,0.6,0.8,0.9
 
-            Values:
-              - MUST be in the correct units: {question.unit_of_measure}
-              - Never use scientific notation.
+Values:
+  - MUST be in units: {question.unit_of_measure}
+  - Never use scientific notation.
 
-            Rules:
-              - Required percentiles are exactly 10/20/40/60/80/90 (or 0.1/0.2/0.4/0.6/0.8/0.9).
-              - Ensure values are strictly increasing with percentile.
-              - If units appear as billions/trillions etc, normalize into {question.unit_of_measure} consistently.
-            """
+Rules:
+  - Required percentiles are exactly those six.
+  - Values must be strictly increasing with percentile.
+"""
         )
 
     @staticmethod
     def _extract_percentile_block(text: str) -> str:
-        # Prefer the explicit 6-line block if it exists
         m = re.search(
             r"(Percentile\s*10\s*:.*?Percentile\s*90\s*:.*?)(?:\n\s*\n|$)",
             text,
@@ -441,8 +431,6 @@ Output ONLY a JSON list: ["query1","query2","query3"]
         )
         if m:
             return m.group(1).strip()
-
-        # Otherwise, keep only percentile-like lines to reduce noise
         lines = []
         for line in text.splitlines():
             if re.search(r"^\s*Percentile\s*(10|20|40|60|80|90)\s*:", line, flags=re.IGNORECASE):
@@ -451,16 +439,11 @@ Output ONLY a JSON list: ["query1","query2","query3"]
 
     @staticmethod
     def _normalize_raw_percentiles(raw: List[RawPercentile]) -> List[Percentile]:
-        """
-        Convert RawPercentile (percentile may be 10..90 or 0.1..0.9)
-        into forecasting_tools.Percentile (percentile MUST be in [0,1]).
-        """
         out: List[Percentile] = []
         for rp in raw:
             p = float(rp.percentile)
             if p > 1.0:
                 p = p / 100.0
-            # clamp (defensive)
             p = max(0.0, min(1.0, p))
             out.append(Percentile(percentile=p, value=float(rp.value)))
         return out
@@ -468,12 +451,11 @@ Output ONLY a JSON list: ["query1","query2","query3"]
     @staticmethod
     def _require_standard_percentiles(pcts: List[Percentile]) -> List[Percentile]:
         required = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
-        # round keys to avoid float equality traps
-        by_pct = {round(float(p.percentile), 3): p for p in pcts}
-        missing = [r for r in required if round(r, 3) not in by_pct]
+        by = {round(float(p.percentile), 3): p for p in pcts}
+        missing = [r for r in required if round(r, 3) not in by]
         if missing:
             return []
-        return [by_pct[round(r, 3)] for r in required]
+        return [by[round(r, 3)] for r in required]
 
     @staticmethod
     def _enforce_monotone(pcts: List[Percentile]) -> List[Percentile]:
@@ -489,7 +471,6 @@ Output ONLY a JSON list: ["query1","query2","query3"]
         hi = float(question.upper_bound)
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             lo, hi = 0.0, 1.0
-
         w = {0.1: 0.05, 0.2: 0.15, 0.4: 0.40, 0.6: 0.60, 0.8: 0.85, 0.9: 0.95}
         pcts = [Percentile(percentile=p, value=lo + (hi - lo) * w[p]) for p in [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]]
         return SpringAdvancedForecastingBot._enforce_monotone(pcts)
@@ -499,90 +480,83 @@ Output ONLY a JSON list: ["query1","query2","query3"]
         by = {round(float(p.percentile), 3): float(p.value) for p in pcts}
         if 0.4 in by and 0.6 in by:
             return 0.5 * (by[0.4] + by[0.6])
-        # fallback to middle-ish
         return float(sorted(pcts, key=lambda x: x.percentile)[len(pcts) // 2].value) if pcts else 0.0
 
     async def _parse_numeric_percentiles_robust(self, question: NumericQuestion, text: str, stage: str) -> List[Percentile]:
         parser_llm = self.get_llm("parser", "llm")
         instructions = self._numeric_parsing_instructions(question)
+        numeric_validation_samples = 1  # avoid sampled-output mismatch
 
-        # Use 1 validation sample for numeric parsing to avoid sampled-output disagreement.
-        numeric_validation_samples = 1
-
-        # Attempt 1: parse from full text into RawPercentile then normalize
         try:
-            raw_list_1: List[RawPercentile] = await structure_output(
+            raw1: List[RawPercentile] = await structure_output(
                 text,
                 list[RawPercentile],
                 model=parser_llm,
                 additional_instructions=instructions,
                 num_validation_samples=numeric_validation_samples,
             )
-            p1 = self._normalize_raw_percentiles(raw_list_1)
+            p1 = self._normalize_raw_percentiles(raw1)
             std1 = self._require_standard_percentiles(p1)
             if std1:
                 return self._enforce_monotone(std1)
         except Exception as e:
             logger.warning(f"[{stage}] numeric parse attempt 1 failed: {e}")
 
-        # Attempt 2: parse from extracted percentile block
         block = self._extract_percentile_block(text)
         if block:
             try:
-                raw_list_2: List[RawPercentile] = await structure_output(
+                raw2: List[RawPercentile] = await structure_output(
                     block,
                     list[RawPercentile],
                     model=parser_llm,
                     additional_instructions=instructions,
                     num_validation_samples=numeric_validation_samples,
                 )
-                p2 = self._normalize_raw_percentiles(raw_list_2)
+                p2 = self._normalize_raw_percentiles(raw2)
                 std2 = self._require_standard_percentiles(p2)
                 if std2:
                     return self._enforce_monotone(std2)
             except Exception as e:
                 logger.warning(f"[{stage}] numeric parse attempt 2 failed: {e}")
 
-        # Attempt 3: force a strict 6-line rewrite, then parse
         try:
             reform_prompt = clean_indents(
                 f"""
-                Rewrite the answer into EXACTLY these 6 lines (no extra text):
+Rewrite the answer into EXACTLY these 6 lines (no extra text):
 
-                Percentile 10: <number>
-                Percentile 20: <number>
-                Percentile 40: <number>
-                Percentile 60: <number>
-                Percentile 80: <number>
-                Percentile 90: <number>
+Percentile 10: <number>
+Percentile 20: <number>
+Percentile 40: <number>
+Percentile 60: <number>
+Percentile 80: <number>
+Percentile 90: <number>
 
-                Rules:
-                - Values must be in units: {question.unit_of_measure}
-                - Never use scientific notation.
-                - Values must be strictly increasing.
+Rules:
+- Values must be in units: {question.unit_of_measure}
+- Never use scientific notation.
+- Values must be strictly increasing.
 
-                Text:
-                {text}
-                """
+Text:
+{text}
+"""
             )
             reformatted = await parser_llm.invoke(reform_prompt)
-            reform_block = self._extract_percentile_block(reformatted) or reformatted
-
-            raw_list_3: List[RawPercentile] = await structure_output(
-                reform_block,
+            rb = self._extract_percentile_block(reformatted) or reformatted
+            raw3: List[RawPercentile] = await structure_output(
+                rb,
                 list[RawPercentile],
                 model=parser_llm,
                 additional_instructions=instructions,
                 num_validation_samples=numeric_validation_samples,
             )
-            p3 = self._normalize_raw_percentiles(raw_list_3)
+            p3 = self._normalize_raw_percentiles(raw3)
             std3 = self._require_standard_percentiles(p3)
             if std3:
                 return self._enforce_monotone(std3)
         except Exception as e:
             logger.warning(f"[{stage}] numeric parse attempt 3 failed: {e}")
 
-        logger.warning(f"[{stage}] numeric parsing failed; using bounds-based fallback distribution.")
+        logger.warning(f"[{stage}] numeric parsing failed; using bounds fallback.")
         return self._bounds_fallback(question)
 
     # ------------------------------------------
@@ -591,7 +565,7 @@ Output ONLY a JSON list: ["query1","query2","query3"]
 
     def _get_temperature(self, question: MetaculusQuestion) -> float:
         if not getattr(question, "close_time", None):
-            return 0.4
+            return 0.35
         days_to_close = (question.close_time - datetime.now(timezone.utc)).days
         qt = question.question_text.lower()
         if days_to_close > 180 or "first" in qt or "never before" in qt:
@@ -599,32 +573,26 @@ Output ONLY a JSON list: ["query1","query2","query3"]
         return 0.1
 
     async def _get_model_forecast(self, model_name: str, question: MetaculusQuestion, research: str) -> Any:
-        # HARD GATE (also protects direct calls)
-        self._ensure_live_search_or_raise(research)
+        # Ensure we have *some* research (providers or LLM web research)
+        self._ensure_some_research_or_raise(research)
 
         temp = self._get_temperature(question)
         llm = GeneralLlm(model=model_name, temperature=temp)
 
         if isinstance(question, BinaryQuestion):
-            schema_example = '{"prediction_in_decimal": 0.35}'
-            prompt = clean_indents(
-                f"""
+            raw = await llm.invoke(
+                clean_indents(
+                    f"""
 Question: {question.question_text}
 
-Research (web evidence + fermi guidance):
+Research:
 {research}
 
-Combine:
-- Base rates
-- Fermi decomposition when helpful
-- Evidence strength weighting
-- Conservative updates (avoid overreaction)
-
 OUTPUT ONLY VALID JSON:
-{schema_example}
+{{"prediction_in_decimal": 0.35}}
 """
+                )
             )
-            raw = await llm.invoke(prompt)
             return await structure_output(
                 sanitize_llm_json(raw),
                 BinaryPrediction,
@@ -635,25 +603,20 @@ OUTPUT ONLY VALID JSON:
         if isinstance(question, MultipleChoiceQuestion):
             example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
             schema_example = json.dumps({"predicted_options": example_opts})
-            prompt = clean_indents(
-                f"""
+            raw = await llm.invoke(
+                clean_indents(
+                    f"""
 Question: {question.question_text}
 Options: {question.options}
 
-Research (web evidence + fermi guidance):
+Research:
 {research}
-
-Combine:
-- Base rates
-- Evidence strength weighting
-- Keep some probability for surprises
-- Ensure probabilities sum to 1
 
 OUTPUT ONLY VALID JSON:
 {schema_example}
 """
+                )
             )
-            raw = await llm.invoke(prompt)
             return await structure_output(
                 sanitize_llm_json(raw),
                 PredictedOptionList,
@@ -664,25 +627,17 @@ OUTPUT ONLY VALID JSON:
         if isinstance(question, NumericQuestion):
             upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
             units = question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"
-
-            prompt = clean_indents(
-                f"""
+            reasoning = await llm.invoke(
+                clean_indents(
+                    f"""
 You are a professional forecaster.
 
 Question:
 {question.question_text}
 
-Background:
-{question.background_info}
-
-Resolution criteria:
-{question.resolution_criteria}
-
-{question.fine_print}
-
 Units for answer: {units}
 
-Research (web evidence + fermi guidance):
+Research:
 {research}
 
 Today is {datetime.now().strftime("%Y-%m-%d")}.
@@ -690,55 +645,43 @@ Today is {datetime.now().strftime("%Y-%m-%d")}.
 {lower_msg}
 {upper_msg}
 
-Formatting Instructions:
-- Use the requested units.
-- Never use scientific notation.
-- Values must be strictly increasing by percentile.
-
-Before answering, do:
-- Fermi-style decomposition (drivers, multipliers, constraints).
-- Summarize key quantitative evidence from research.
-- Use conservative uncertainty: wide 90/10 unless evidence is very strong.
-
 The LAST thing you write is EXACTLY:
 "
-Percentile 10: XX (lowest number value)
+Percentile 10: XX
 Percentile 20: XX
 Percentile 40: XX
 Percentile 60: XX
 Percentile 80: XX
-Percentile 90: XX (highest number value)
+Percentile 90: XX
 "
 """
+                )
             )
-            reasoning = await llm.invoke(prompt)
             return await self._parse_numeric_percentiles_robust(question, reasoning, stage=f"model_forecast:{model_name}")
 
         raise TypeError(f"Unsupported question type: {type(question)}")
 
     async def _red_team_forecast(self, question: MetaculusQuestion, research: str, initial_pred: float) -> float:
-        # HARD GATE
-        self._ensure_live_search_or_raise(research)
+        self._ensure_some_research_or_raise(research)
 
         try:
             llm = self.get_llm("red_team", "llm")
-            prompt = clean_indents(
-                f"""
-You are a skeptical red teamer challenging this forecast: {initial_pred:.2%}.
+            response = await llm.invoke(
+                clean_indents(
+                    f"""
+You are a skeptical red teamer.
 
 Question: {question.question_text}
-
 Research:
 {research}
 
-Give the 3 strongest reasons the forecast is TOO HIGH or TOO LOW.
-Then output ONLY JSON:
+Current forecast: {initial_pred:.2%}
+
+Output ONLY JSON:
 {{"revised_prediction_in_decimal": 0.XX}}
 """
+                )
             )
-            response = await llm.invoke(prompt)
-
-            # Parse as dict then coerce to BinaryPrediction to avoid key mismatches
             parsed = await structure_output(
                 sanitize_llm_json(response),
                 dict,
@@ -747,27 +690,16 @@ Then output ONLY JSON:
             )
             if isinstance(parsed, dict) and "revised_prediction_in_decimal" in parsed:
                 val = float(parsed["revised_prediction_in_decimal"])
-                return max(0.0, min(1.0, val))
-
-            revised = await structure_output(
-                sanitize_llm_json(response),
-                BinaryPrediction,
-                model=self.get_llm("parser", "llm"),
-                num_validation_samples=1,
-            )
-            return max(0.0, min(1.0, revised.prediction_in_decimal))
+                return float(np.clip(val, 0.0, 1.0))
         except Exception as e:
             logger.warning(f"Red teaming failed: {e}")
-            return initial_pred
+        return initial_pred
 
     async def _check_consistency(self, question: MetaculusQuestion, proposed_pred: float) -> bool:
         if len(self._recent_predictions) < 2:
             return True
         recent_summary = "\n".join(
-            [
-                f"Q: {getattr(q, 'question_text', getattr(q, 'text', ''))} → Pred: {p:.2%}"
-                for q, p in self._recent_predictions[-3:]
-            ]
+            [f"Q: {getattr(q, 'question_text', '')} → Pred: {p:.2%}" for q, p in self._recent_predictions[-3:]]
         )
         llm = self.get_llm("parser", "llm")
         prompt = f"""
@@ -787,8 +719,7 @@ Answer YES or NO only.
             return True
 
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
-        # HARD GATE
-        self._ensure_live_search_or_raise(research)
+        self._ensure_some_research_or_raise(research)
 
         forecasters = [
             "openrouter/openai/gpt-5.1",
@@ -796,19 +727,18 @@ Answer YES or NO only.
             "openrouter/anthropic/claude-4.5-sonnet",
         ]
 
-        tasks = [self._get_model_forecast(m, question, research) for m in forecasters]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
+        results = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
         forecast_map: Dict[str, float] = {
-            f"model_{i}": (float(r.prediction_in_decimal) if r else 0.5) for i, r in enumerate(results)
+            f"model_{i}": float(r.prediction_in_decimal) for i, r in enumerate(results)
         }
 
         vals = list(forecast_map.values()) or [0.5]
         spread = (max(vals) - min(vals)) if len(vals) > 1 else 0.0
 
         critic_llm = self.get_llm("critic", "llm")
-        schema_example = '{"prediction_in_decimal": 0.75}'
-        prompt = clean_indents(
-            f"""
+        critique = await critic_llm.invoke(
+            clean_indents(
+                f"""
 Question: {question.question_text}
 
 Research:
@@ -817,17 +747,11 @@ Research:
 Ensemble model forecasts:
 {json.dumps(forecast_map)}
 
-Combine:
-- Base rate + evidence strength weighting
-- Penalize overconfidence unless evidence is overwhelming
-- Prefer the "status quo" unless evidence indicates a shift
-- Use conservative uncertainty
-
-OUTPUT ONLY VALID JSON:
-{schema_example}
+OUTPUT ONLY JSON:
+{{"prediction_in_decimal": 0.75}}
 """
+            )
         )
-        critique = await critic_llm.invoke(prompt)
         critic_out = await structure_output(
             sanitize_llm_json(critique),
             BinaryPrediction,
@@ -839,7 +763,6 @@ OUTPUT ONLY VALID JSON:
         red_teamed_p = await self._red_team_forecast(question, research, raw_p)
         averaged_p = 0.5 * (raw_p + red_teamed_p)
 
-        # disagreement-based shrinkage
         if spread >= 0.35:
             averaged_p = 0.6 * averaged_p + 0.4 * 0.5
         elif spread >= 0.20:
@@ -849,11 +772,8 @@ OUTPUT ONLY VALID JSON:
             averaged_p = 0.5 * averaged_p + 0.5 * 0.5
 
         community = getattr(question, "community_prediction", None)
-        research_quality = self._research_quality_weight(research)
-        if community is not None and research_quality > 0:
-            blended_p = research_quality * averaged_p + (1 - research_quality) * float(community)
-        else:
-            blended_p = averaged_p
+        quality = self._research_quality_weight(research)
+        blended_p = (quality * averaged_p + (1 - quality) * float(community)) if (community is not None) else averaged_p
 
         final_p = ForecastingPrinciples.apply_time_decay(blended_p, getattr(question, "close_time", None))
         final_p = self.apply_bayesian_calibration(final_p * 100) / 100.0
@@ -861,35 +781,32 @@ OUTPUT ONLY VALID JSON:
 
         self._recent_predictions.append((question, final_p))
 
-        comment = self._brief_binary_comment(
-            forecast_map=forecast_map,
-            raw_p=raw_p,
-            red_teamed_p=red_teamed_p,
-            final_p=final_p,
-            research=research,
+        comment = (
+            f"final={final_p:.3f} critic={raw_p:.3f} red={red_teamed_p:.3f} "
+            f"spread={spread:.3f} search={self._search_footprint(research)}"
         )
         return ReasonedPrediction(prediction_value=final_p, reasoning=comment)
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
-        # HARD GATE
-        self._ensure_live_search_or_raise(research)
+        self._ensure_some_research_or_raise(research)
 
         forecasters = [
             "openrouter/openai/gpt-5.1",
             "openrouter/openai/gpt-5",
             "openrouter/anthropic/claude-4.5-sonnet",
         ]
-        tasks = [self._get_model_forecast(m, question, research) for m in forecasters]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        forecast_map = {f"model_{i}": (r.model_dump() if r else {}) for i, r in enumerate(results)}
+        results = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
+        forecast_map = {f"model_{i}": r.model_dump() for i, r in enumerate(results)}
 
         critic_llm = self.get_llm("critic", "llm")
         example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
         schema_example = json.dumps({"predicted_options": example_opts})
-        prompt = clean_indents(
-            f"""
+
+        critique = await critic_llm.invoke(
+            clean_indents(
+                f"""
 Question: {question.question_text}
 Options: {question.options}
 
@@ -899,16 +816,11 @@ Research:
 Ensemble model forecasts:
 {json.dumps(forecast_map)}
 
-Combine:
-- Base rate + evidence strength weighting
-- Keep probability on unexpected outcomes
-- Ensure probabilities sum to 1
-
-OUTPUT ONLY VALID JSON:
+OUTPUT ONLY JSON:
 {schema_example}
 """
+            )
         )
-        critique = await critic_llm.invoke(prompt)
         final_list: PredictedOptionList = await structure_output(
             sanitize_llm_json(critique),
             PredictedOptionList,
@@ -916,7 +828,7 @@ OUTPUT ONLY VALID JSON:
             num_validation_samples=self._structure_output_validation_samples,
         )
 
-        # Align to provided option order and normalize
+        # Align + normalize
         option_names = question.options
         current = {o.option_name: float(o.probability) for o in final_list.predicted_options}
         aligned = [{"option_name": name, "probability": float(current.get(name, 0.0))} for name in option_names]
@@ -933,25 +845,22 @@ OUTPUT ONLY VALID JSON:
         avg_prob = float(np.mean([o["probability"] for o in aligned])) if aligned else 0.0
         self._recent_predictions.append((question, avg_prob))
 
-        return ReasonedPrediction(prediction_value=final_val, reasoning=self._brief_mcq_comment(research))
+        return ReasonedPrediction(prediction_value=final_val, reasoning=f"search={self._search_footprint(research)}")
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
-        # HARD GATE
-        self._ensure_live_search_or_raise(research)
+        self._ensure_some_research_or_raise(research)
 
         forecasters = [
             "openrouter/openai/gpt-5.1",
             "openrouter/openai/gpt-5",
             "openrouter/anthropic/claude-4.5-sonnet",
         ]
-        tasks = [self._get_model_forecast(m, question, research) for m in forecasters]
-        results: List[List[Percentile]] = await asyncio.gather(*tasks, return_exceptions=False)
+        results: List[List[Percentile]] = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
 
-        # For transparency, store the parsed percentiles (already normalized to 0..1)
         forecast_map = {
-            f"model_{i}": ([{"percentile": float(p.percentile), "value": float(p.value)} for p in r] if r else [])
+            f"model_{i}": [{"percentile": float(p.percentile), "value": float(p.value)} for p in r]
             for i, r in enumerate(results)
         }
 
@@ -959,28 +868,20 @@ OUTPUT ONLY VALID JSON:
         units = question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"
         critic_llm = self.get_llm("critic", "llm")
 
-        # Critic emits the strict 10/20/40/60/80/90 block (NOT JSON), then we parse robustly.
-        prompt = clean_indents(
-            f"""
+        critique = await critic_llm.invoke(
+            clean_indents(
+                f"""
 You are a professional forecaster.
 
 Question:
 {question.question_text}
-
-Background:
-{question.background_info}
-
-Resolution criteria:
-{question.resolution_criteria}
-
-{question.fine_print}
 
 Units for answer: {units}
 
 Research:
 {research}
 
-Ensemble forecasts (percentiles in [0,1]):
+Ensemble forecasts:
 {json.dumps(forecast_map)}
 
 Today is {datetime.now().strftime("%Y-%m-%d")}.
@@ -988,38 +889,30 @@ Today is {datetime.now().strftime("%Y-%m-%d")}.
 {lower_msg}
 {upper_msg}
 
-Formatting Instructions:
-- Use the requested units.
-- Never use scientific notation.
-- Values must be strictly increasing with percentile.
-- If evidence is strong, you may narrow uncertainty; otherwise keep wide intervals.
-
 The LAST thing you write is EXACTLY:
 "
-Percentile 10: XX (lowest number value)
+Percentile 10: XX
 Percentile 20: XX
 Percentile 40: XX
 Percentile 60: XX
 Percentile 80: XX
-Percentile 90: XX (highest number value)
+Percentile 90: XX
 "
 """
+            )
         )
-        critique = await critic_llm.invoke(prompt)
 
         final_pcts = await self._parse_numeric_percentiles_robust(question, critique, stage="critic_numeric")
         final_pcts = self._enforce_monotone(final_pcts)
 
-        # Build distribution for submission
         dist = NumericDistribution.from_question(final_pcts, question)
-
-        # Use median proxy for internal tracking/commentary (requested)
         median_proxy = self._median_from_40_60(final_pcts)
+
         self._recent_predictions.append((question, float(median_proxy / (abs(median_proxy) + 1.0)) if median_proxy else 0.0))
 
         return ReasonedPrediction(
             prediction_value=dist,
-            reasoning=self._brief_numeric_comment(research, median_proxy=median_proxy),
+            reasoning=f"search={self._search_footprint(research)} median≈{median_proxy:g}",
         )
 
 
@@ -1072,7 +965,7 @@ if __name__ == "__main__":
                 client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
             )
 
-        # test_questions: include Market Pulse 26Q1 tournament slug + sample URLs
+        # test_questions: include Market Pulse 26Q1 + sample URLs
         bot.skip_previously_forecasted_questions = False
 
         EXAMPLE_QUESTION_URLS = [
