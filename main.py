@@ -6,7 +6,7 @@ import re
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Any, Dict, List, Optional
+from typing import Literal, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import dotenv
@@ -54,7 +54,7 @@ def sanitize_llm_json(text: str) -> str:
         nums = re.findall(r"[-+]?\d*\.\d+|\d+", val)
         return f"\"{match.group(1)}\": {nums[0]}" if nums else match.group(0)
 
-    text = re.sub(r"\"(value|percentile)\":\s*\"([^\"]+)\"", clean_num, text)
+    text = re.sub(r"\"(value|percentile|probability|prediction_in_decimal)\":\s*\"([^\"]+)\"", clean_num, text)
 
     text = text.strip()
     if text.startswith("```json"):
@@ -169,6 +169,13 @@ Account for uncertainty in each step.
 # ==========================================
 
 class SpringAdvancedForecastingBot(ForecastBot):
+    """
+    Updated numeric handling to match the SpringTemplateBot2026 contract:
+      - Forecasting LLM produces reasoning + a strict percentile block (10/20/40/60/80/90)
+      - Explicit formatting constraints (units, no scientific notation, increasing percentiles)
+      - Parser LLM extracts list[Percentile] with unit normalization instructions
+      - NumericDistribution.from_question(...) builds the final distribution
+    """
     _structure_output_validation_samples = 2
 
     def __init__(self, *args, **kwargs):
@@ -349,6 +356,83 @@ Output ONLY a JSON list: ["query1", "query2", "query3"]
 {combined}"""
 
     # ------------------------------------------
+    # Helpers: numeric bounds + numeric parsing instructions
+    # ------------------------------------------
+
+    def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> Tuple[str, str]:
+        # Mirrors the template logic (nominal bounds preferred for messaging)
+        if question.nominal_upper_bound is not None:
+            upper_bound_number = question.nominal_upper_bound
+        else:
+            upper_bound_number = question.upper_bound
+
+        if question.nominal_lower_bound is not None:
+            lower_bound_number = question.nominal_lower_bound
+        else:
+            lower_bound_number = question.lower_bound
+
+        unit = question.unit_of_measure or ""
+
+        if getattr(question, "open_upper_bound", False):
+            upper_msg = f"The question creator thinks the number is likely not higher than {upper_bound_number} {unit}."
+        else:
+            upper_msg = f"The outcome can not be higher than {upper_bound_number} {unit}."
+
+        if getattr(question, "open_lower_bound", False):
+            lower_msg = f"The question creator thinks the number is likely not lower than {lower_bound_number} {unit}."
+        else:
+            lower_msg = f"The outcome can not be lower than {lower_bound_number} {unit}."
+
+        return upper_msg, lower_msg
+
+    def _numeric_parsing_instructions(self, question: NumericQuestion) -> str:
+        return clean_indents(
+            f"""
+            The text given to you is trying to give a forecast distribution for a numeric question.
+            - This text is trying to answer the numeric question: "{question.question_text}".
+            - When parsing the text, please make sure to give the values (the ones assigned to percentiles) in terms of the correct units.
+            - The units for the forecast are: {question.unit_of_measure}
+            - Your work will be shown publicly with these units stated verbatim after the numbers you parse.
+            - As an example, someone else guessed that the answer will be between {question.lower_bound} {question.unit_of_measure} and {question.upper_bound} {question.unit_of_measure},
+              so the numbers parsed from an answer like this would be verbatim "{question.lower_bound}" and "{question.upper_bound}".
+            - If the answer doesn't give the answer in the correct units, you should parse it in the right units.
+              For instance if the answer gives numbers as $500,000,000 and units are "B $" then you should parse the answer as 0.5 (since $500,000,000 is $0.5 billion).
+            - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output,
+              but rather indicate that the answer is not explicitly given in the text.
+            - Turn any values that are in scientific notation into regular numbers.
+            - IMPORTANT: the required percentiles are exactly 10, 20, 40, 60, 80, and 90.
+            """
+        )
+
+    def _enforce_numeric_percentiles_monotone(self, pcts: List[Percentile]) -> List[Percentile]:
+        # Sort by percentile, and ensure increasing values
+        pcts = sorted(pcts, key=lambda x: x.percentile)
+        for i in range(1, len(pcts)):
+            if pcts[i].value <= pcts[i - 1].value:
+                pcts[i].value = pcts[i - 1].value + 1e-6
+        return pcts
+
+    def _require_standard_numeric_percentiles(self, pcts: List[Percentile]) -> List[Percentile]:
+        # Require the exact set used by the template bot
+        required = [10, 20, 40, 60, 80, 90]
+        by_pct = {int(p.percentile): p for p in pcts if int(p.percentile) in required}
+        missing = [r for r in required if r not in by_pct]
+        if missing:
+            raise ValueError(f"Missing required percentiles: {missing}. Got: {sorted(by_pct.keys())}")
+        return [by_pct[r] for r in required]
+
+    def _pseudo_median_from_40_60(self, pcts: List[Percentile]) -> float:
+        by_pct = {int(p.percentile): float(p.value) for p in pcts}
+        if 40 in by_pct and 60 in by_pct:
+            return 0.5 * (by_pct[40] + by_pct[60])
+        # fallback: use 60 if present else 40 else first
+        if 60 in by_pct:
+            return by_pct[60]
+        if 40 in by_pct:
+            return by_pct[40]
+        return float(pcts[len(pcts) // 2].value) if pcts else 0.0
+
+    # ------------------------------------------
     # Forecasting
     # ------------------------------------------
 
@@ -362,59 +446,165 @@ Output ONLY a JSON list: ["query1", "query2", "query3"]
         return 0.1
 
     async def _get_model_forecast(self, model_name: str, question: MetaculusQuestion, research: str) -> Any:
+        """
+        Returns:
+          - BinaryQuestion -> BinaryPrediction
+          - MultipleChoiceQuestion -> PredictedOptionList
+          - NumericQuestion -> list[Percentile] (standard 10/20/40/60/80/90), parsed from a formatted text block
+        """
         temp = self._get_temperature(question)
         llm = GeneralLlm(model=model_name, temperature=temp)
 
         if isinstance(question, BinaryQuestion):
             schema_example = '{"prediction_in_decimal": 0.35}'
             out_type = BinaryPrediction
-        elif isinstance(question, MultipleChoiceQuestion):
+            prompt = clean_indents(
+                f"""
+                Question: {question.question_text}
+                Research: {research}
+
+                Apply forecasting best practices:
+                - Start from general priors
+                - Decompose complex problems
+                - Avoid over-updating on recent news
+                - Favor structural stability
+                - Quantify uncertainty
+
+                OUTPUT ONLY VALID JSON:
+                {schema_example}
+                """
+            )
+            raw = await llm.invoke(prompt)
+            return await structure_output(
+                sanitize_llm_json(raw),
+                out_type,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+
+        if isinstance(question, MultipleChoiceQuestion):
             example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
             schema_example = json.dumps({"predicted_options": example_opts})
             out_type = PredictedOptionList
-        else:
-            schema_example = '[{"percentile": 10, "value": 100}, {"percentile": 50, "value": 200}, {"percentile": 90, "value": 500}]'
-            out_type = list[Percentile]
+            prompt = clean_indents(
+                f"""
+                Question: {question.question_text}
+                Options: {question.options}
+                Research: {research}
 
-        prompt = clean_indents(
-            f"""
-Question: {question.question_text}
-Research: {research}
+                Apply forecasting best practices:
+                - Start from general priors
+                - Decompose complex problems
+                - Avoid over-updating on recent news
+                - Favor structural stability
+                - Quantify uncertainty
+                - Leave some probability mass on unexpected outcomes
 
-Apply forecasting best practices:
-- Start from general priors
-- Decompose complex problems
-- Avoid over-updating on recent news
-- Favor structural stability
-- Quantify uncertainty
+                OUTPUT ONLY VALID JSON:
+                {schema_example}
+                """
+            )
+            raw = await llm.invoke(prompt)
+            return await structure_output(
+                sanitize_llm_json(raw),
+                out_type,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
 
-OUTPUT ONLY VALID JSON:
-{schema_example}
-"""
-        )
+        # Numeric: adopt template-style formatted percentile block + parser extraction
+        if isinstance(question, NumericQuestion):
+            upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
+            units = question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"
+            prompt = clean_indents(
+                f"""
+                You are a professional forecaster.
 
-        raw = await llm.invoke(prompt)
-        return await structure_output(sanitize_llm_json(raw), out_type, model=self.get_llm("parser", "llm"))
+                Your question is:
+                {question.question_text}
+
+                Background:
+                {question.background_info}
+
+                Resolution criteria:
+                {question.resolution_criteria}
+
+                {question.fine_print}
+
+                Units for answer: {units}
+
+                Research:
+                {research}
+
+                Today is {datetime.now().strftime("%Y-%m-%d")}.
+
+                {lower_msg}
+                {upper_msg}
+
+                Formatting Instructions:
+                - Please notice the units requested and give your answer in these units (e.g. whether you represent a number as 1,000,000 or 1 million).
+                - Never use scientific notation.
+                - Always start with a smaller number (more negative if negative) and then increase from there.
+                  The value for percentile 10 should always be less than the value for percentile 20, and so on.
+
+                Before answering you write:
+                (a) The time left until the outcome to the question is known.
+                (b) The outcome if nothing changed.
+                (c) The outcome if the current trend continued.
+                (d) The expectations of experts and markets.
+                (e) A brief description of an unexpected scenario that results in a low outcome.
+                (f) A brief description of an unexpected scenario that results in a high outcome.
+
+                You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+
+                The last thing you write is your final answer as:
+                "
+                Percentile 10: XX (lowest number value)
+                Percentile 20: XX
+                Percentile 40: XX
+                Percentile 60: XX
+                Percentile 80: XX
+                Percentile 90: XX (highest number value)
+                "
+                """
+            )
+
+            reasoning = await llm.invoke(prompt)
+
+            parsed: List[Percentile] = await structure_output(
+                reasoning,
+                list[Percentile],
+                model=self.get_llm("parser", "llm"),
+                additional_instructions=self._numeric_parsing_instructions(question),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+
+            parsed = self._require_standard_numeric_percentiles(parsed)
+            parsed = self._enforce_numeric_percentiles_monotone(parsed)
+            return parsed
+
+        raise TypeError(f"Unsupported question type: {type(question)}")
 
     async def _red_team_forecast(self, question: MetaculusQuestion, research: str, initial_pred: float) -> float:
         try:
             llm = self.get_llm("red_team", "llm")
             prompt = clean_indents(
                 f"""
-You are a skeptical red teamer challenging this forecast: {initial_pred:.2%}.
-Question: {question.question_text}
-Research: {research}
+                You are a skeptical red teamer challenging this forecast: {initial_pred:.2%}.
+                Question: {question.question_text}
+                Research: {research}
 
-Identify 3 strongest reasons why this forecast is TOO HIGH or TOO LOW.
-Then output ONLY: {{"revised_prediction_in_decimal": 0.XX}}
-Avoid markdown. Only JSON.
-"""
+                Identify 3 strongest reasons why this forecast is TOO HIGH or TOO LOW.
+                Then output ONLY: {{"revised_prediction_in_decimal": 0.XX}}
+                Avoid markdown. Only JSON.
+                """
             )
             response = await llm.invoke(prompt)
             revised = await structure_output(
                 sanitize_llm_json(response),
                 BinaryPrediction,
                 model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
             )
             return revised.prediction_in_decimal
         except Exception as e:
@@ -474,7 +664,7 @@ Answer YES or NO only.
             f"model_{i}": (r.prediction_in_decimal if r else 0.5) for i, r in enumerate(results)
         }
 
-        # disagreement-based shrinkage (helps Brier/log score)
+        # disagreement-based shrinkage
         vals = list(forecast_map.values()) or [0.5]
         spread = (max(vals) - min(vals)) if len(vals) > 1 else 0.0
 
@@ -502,6 +692,7 @@ OUTPUT ONLY VALID JSON:
             sanitize_llm_json(critique),
             BinaryPrediction,
             model=self.get_llm("parser", "llm"),
+            num_validation_samples=self._structure_output_validation_samples,
         )
         raw_p = critic_out.prediction_in_decimal
 
@@ -566,10 +757,16 @@ OUTPUT ONLY VALID JSON:
         prompt = clean_indents(
             f"""
 Question: {question.question_text}
+Options: {question.options}
 Research: {research}
 Ensemble Forecasts: {json.dumps(forecast_map)}
 
-Apply forecasting best practices...
+Apply forecasting best practices:
+- Start from general priors
+- Avoid recency/salience bias
+- Favor structural stability
+- Leave some probability mass on unexpected outcomes
+- Ensure probabilities sum to 1
 
 OUTPUT ONLY VALID JSON:
 {schema_example}
@@ -580,12 +777,14 @@ OUTPUT ONLY VALID JSON:
             sanitize_llm_json(critique),
             PredictedOptionList,
             model=self.get_llm("parser", "llm"),
+            num_validation_samples=self._structure_output_validation_samples,
         )
 
+        # Align to provided option order and normalize
         option_names = question.options
         current_options = {o.option_name: o.probability for o in final_list.predicted_options}
-        aligned_options = [{"option_name": name, "probability": current_options.get(name, 0.0)} for name in option_names]
-        total = sum(o["probability"] for o in aligned_options)
+        aligned_options = [{"option_name": name, "probability": float(current_options.get(name, 0.0))} for name in option_names]
+        total = float(sum(o["probability"] for o in aligned_options))
         if total == 0:
             uniform_p = 1.0 / len(aligned_options)
             for o in aligned_options:
@@ -606,6 +805,12 @@ OUTPUT ONLY VALID JSON:
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
+        """
+        Updated to match the template numeric format:
+          - forecast models produce percentile block (10/20/40/60/80/90)
+          - critic also produces the same block
+          - parser extracts list[Percentile] with unit normalization instructions
+        """
         forecasters = [
             "openrouter/openai/gpt-5.1",
             "openrouter/openai/gpt-5",
@@ -613,38 +818,83 @@ OUTPUT ONLY VALID JSON:
         ]
         tasks = [self._get_model_forecast(m, question, research) for m in forecasters]
         results = await asyncio.gather(*tasks, return_exceptions=False)
-        forecast_map = {f"model_{i}": ([p.model_dump() for p in r] if r else []) for i, r in enumerate(results)}
+
+        # results are list[Percentile]
+        forecast_map = {
+            f"model_{i}": ([p.model_dump() for p in r] if r else [])
+            for i, r in enumerate(results)
+        }
+
+        upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
+        units = question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"
 
         critic_llm = self.get_llm("critic", "llm")
-        schema_example = '[{"percentile": 10, "value": 100}, {"percentile": 50, "value": 200}, {"percentile": 90, "value": 500}]'
         prompt = clean_indents(
             f"""
-Question: {question.question_text}
-Research: {research}
-Ensemble Forecasts: {json.dumps(forecast_map)}
+            You are a professional forecaster.
 
-Apply forecasting best practices...
+            Question:
+            {question.question_text}
 
-OUTPUT ONLY VALID JSON:
-{schema_example}
-"""
+            Background:
+            {question.background_info}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            {question.fine_print}
+
+            Units for answer: {units}
+
+            Research:
+            {research}
+
+            Ensemble Forecasts (already parsed to percentiles):
+            {json.dumps(forecast_map)}
+
+            Today is {datetime.now().strftime("%Y-%m-%d")}.
+
+            {lower_msg}
+            {upper_msg}
+
+            Formatting Instructions:
+            - Please notice the units requested and give your answer in these units.
+            - Never use scientific notation.
+            - Always start with a smaller number (more negative if negative) and then increase from there.
+              The value for percentile 10 should always be less than percentile 20, and so on.
+            - Use a wide 90/10 interval to account for unknown unknowns.
+
+            The last thing you write is your final answer as:
+            "
+            Percentile 10: XX (lowest number value)
+            Percentile 20: XX
+            Percentile 40: XX
+            Percentile 60: XX
+            Percentile 80: XX
+            Percentile 90: XX (highest number value)
+            "
+            """
         )
         critique = await critic_llm.invoke(prompt)
-        final_pcts: list[Percentile] = await structure_output(
-            sanitize_llm_json(critique),
+
+        final_pcts: List[Percentile] = await structure_output(
+            critique,
             list[Percentile],
             model=self.get_llm("parser", "llm"),
+            additional_instructions=self._numeric_parsing_instructions(question),
+            num_validation_samples=self._structure_output_validation_samples,
         )
 
-        final_pcts.sort(key=lambda x: x.percentile)
-        for i in range(1, len(final_pcts)):
-            if final_pcts[i].value <= final_pcts[i - 1].value:
-                final_pcts[i].value = final_pcts[i - 1].value + 1e-6
+        final_pcts = self._require_standard_numeric_percentiles(final_pcts)
+        final_pcts = self._enforce_numeric_percentiles_monotone(final_pcts)
 
         dist = NumericDistribution.from_question(final_pcts, question)
 
-        median_val = next((p.value for p in final_pcts if p.percentile == 50), 0.0)
-        self._recent_predictions.append((question, float(median_val / (median_val + 1)) if median_val else 0.0))
+        # Update recent_predictions with a stable proxy based on pseudo-median (40/60 average)
+        pseudo_median = self._pseudo_median_from_40_60(final_pcts)
+        self._recent_predictions.append(
+            (question, float(pseudo_median / (abs(pseudo_median) + 1.0)) if pseudo_median else 0.0)
+        )
 
         return ReasonedPrediction(
             prediction_value=dist,
