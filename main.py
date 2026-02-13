@@ -1,17 +1,55 @@
+#!/usr/bin/env python3
+"""
+spring_advanced_forecasting_bot_updated.py
+
+Updated SpringAdvancedForecastingBot with these practical improvements:
+
+1) Short, user-facing reasoning string for each forecast:
+   - Approach summary (research sources used, ensemble + critic + red-team)
+   - Key aggregation controls applied (spread shrink, consistency check, extremize, calibration, time-decay, blending)
+   - Final forecast value (or median proxy for numeric, avg prob for MC)
+
+2) Extremization (optional, enabled by default):
+   - Applies a logistic/log-odds extremizing transform that pushes probabilities
+     away from 0.5 when research strength and model agreement are strong.
+   - Dampens extremization when research is weak, or models disagree, or near close time.
+
+3) Question decomposition (optional):
+   - Light decomposition to produce better search queries + research framing.
+   - Does NOT change Metaculus resolution criteria; only helps research/analysis.
+
+4) Meta-forecast integration (stub, optional):
+   - Placeholder hook for Metaforecast or other aggregators.
+   - Safely no-ops unless enabled and implemented.
+
+5) “bot name” set to botduke:
+   - Exposed via --bot-name; default is "botduke".
+
+Notes:
+- This file assumes the original `forecasting_tools` library is installed and
+  compatible with these imports.
+- External search APIs (Tavily/Exa/AskNews) remain optional; fallback LLM web research
+  is used if configured.
+- The code is designed to be run as a script in CI/GitHub, and to publish
+  reports to Metaculus if enabled.
+
+"""
+
 import argparse
 import asyncio
 import logging
 import os
 import re
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import numpy as np
 import dotenv
-from pydantic import BaseModel, Field
 import httpx
+from pydantic import BaseModel, Field
 
 from tavily import TavilyClient
 
@@ -25,7 +63,7 @@ from forecasting_tools import (
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
-    Percentile,  # forecasting_tools.Percentile expects percentile in [0,1]
+    Percentile,  # expects percentile in [0,1]
     BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
@@ -40,11 +78,17 @@ LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 
 
-# ==========================================
+# =========================================================
 # 🛡️ DATA SANITIZATION UTILITIES
-# ==========================================
+# =========================================================
 
 def sanitize_llm_json(text: str) -> str:
+    """
+    Attempts to clean up common LLM JSON output issues:
+    - remove numeric underscores in numbers (e.g., 1_000 -> 1000)
+    - coerce some quoted numeric fields into proper numbers
+    - strip ```json fences
+    """
     text = re.sub(r"(?<=\d)_(?=\d)", "", text)
 
     def clean_num(match):
@@ -67,6 +111,9 @@ def sanitize_llm_json(text: str) -> str:
 
 
 def safe_model(model_cls: type[BaseModel], data: Any) -> BaseModel:
+    """
+    Validate/coerce incoming data into a Pydantic model with helpful logging.
+    """
     try:
         if isinstance(data, model_cls):
             return data
@@ -82,9 +129,9 @@ def safe_model(model_cls: type[BaseModel], data: Any) -> BaseModel:
         raise
 
 
-# ==========================================
+# =========================================================
 # ✅ RAW MODELS TO AVOID Percentile VALIDATION ERRORS
-# ==========================================
+# =========================================================
 
 class RawPercentile(BaseModel):
     """
@@ -95,9 +142,9 @@ class RawPercentile(BaseModel):
     value: float
 
 
-# ==========================================
+# =========================================================
 # 🔍 EXA SEARCH CLIENT
-# ==========================================
+# =========================================================
 
 class ExaSearcher:
     def __init__(self):
@@ -132,9 +179,9 @@ class ExaSearcher:
             return "[Exa search failed]"
 
 
-# ==========================================
-# 🧠 FORECASTING PRINCIPLES
-# ==========================================
+# =========================================================
+# 🧠 FORECASTING PRINCIPLES + EXTREMIZATION
+# =========================================================
 
 class ForecastingPrinciples:
     @staticmethod
@@ -157,6 +204,10 @@ FERMI GUIDANCE:
 
     @staticmethod
     def apply_time_decay(prob: float, close_time: Optional[datetime]) -> float:
+        """
+        If far from close, gently shrink toward 0.5.
+        (This is *anti-extremizing*, so we balance it with optional extremization.)
+        """
         if close_time is None:
             return prob
         now = datetime.now(timezone.utc)
@@ -172,29 +223,72 @@ FERMI GUIDANCE:
         else:
             return prob
 
+    @staticmethod
+    def logit(p: float) -> float:
+        p = float(np.clip(p, 1e-6, 1 - 1e-6))
+        return float(np.log(p / (1 - p)))
 
-# ==========================================
-# 🤖 SPRING ADVANCED FORECASTING BOT
-# ==========================================
+    @staticmethod
+    def sigmoid(x: float) -> float:
+        return float(1 / (1 + np.exp(-x)))
+
+    @classmethod
+    def extremize_logit(cls, p: float, strength: float) -> float:
+        """
+        Logistic/log-odds extremization: p' = sigmoid(strength * logit(p))
+        strength > 1 pushes away from 0.5; strength < 1 shrinks toward 0.5.
+        """
+        strength = float(np.clip(strength, 0.5, 3.0))
+        return float(np.clip(cls.sigmoid(strength * cls.logit(p)), 0.0, 1.0))
+
+
+# =========================================================
+# 🧩 OPTIONAL: QUESTION DECOMPOSITION MODEL
+# =========================================================
+
+class DecompositionOutput(BaseModel):
+    subquestions: List[str] = Field(default_factory=list)
+    key_entities: List[str] = Field(default_factory=list)
+    key_metrics: List[str] = Field(default_factory=list)
+
+
+# =========================================================
+# 🤖 UPDATED BOT
+# =========================================================
+
+@dataclass
+class BotFeatureFlags:
+    enable_extremize: bool = True
+    enable_decomposition: bool = True
+    enable_meta_forecast: bool = False
+
 
 class SpringAdvancedForecastingBot(ForecastBot):
     """
-    Fixes in this revision:
-      - NO hard failure if Tavily/Exa/AskNews not configured.
-      - Research ALWAYS runs using whatever is available:
-          Tavily / Exa / AskNews / (fallback) the bot's configured "researcher" LLM.
-      - "Live web search" requirement is satisfied either via Tavily/Exa/AskNews OR via the web-enabled researcher model.
+    An updated ForecastBot with:
+    - Robust multi-source research (Tavily/Exa/AskNews + LLM web fallback).
+    - Ensemble forecasters + critic + red-team.
+    - Optional extremization (logit-based), driven by research quality + agreement.
+    - Short, final reasoning comment (for Metaculus submission).
     """
+
     _structure_output_validation_samples = 2
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, bot_name: str = "botduke", flags: Optional[BotFeatureFlags] = None, **kwargs):
         super().__init__(*args, **kwargs)
+        self.bot_name = bot_name
+        self.flags = flags or BotFeatureFlags()
 
         self.tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY")) if os.getenv("TAVILY_API_KEY") else None
         self.exa_searcher = ExaSearcher() if os.getenv("EXA_API_KEY") else None
         self.asknews_client_id = os.getenv("ASKNEWS_CLIENT_ID")
         self.asknews_client_secret = os.getenv("ASKNEWS_CLIENT_SECRET")
+
         self._recent_predictions: list[tuple[MetaculusQuestion, float]] = []
+
+    # ------------------------------------------
+    # LLM Config
+    # ------------------------------------------
 
     def _llm_config_defaults(self) -> Dict[str, str]:
         return {
@@ -205,10 +299,11 @@ class SpringAdvancedForecastingBot(ForecastBot):
             "query_optimizer": "openrouter/openai/gpt-4o-mini",
             "critic": "openrouter/openai/gpt-5",
             "red_team": "openrouter/openai/gpt-4o",
+            "decomposer": "openrouter/openai/gpt-4o-mini",
         }
 
     # ------------------------------------------
-    # Research footprint + gating (soft)
+    # Research footprint + gating
     # ------------------------------------------
 
     def _search_footprint(self, research: str) -> str:
@@ -225,36 +320,93 @@ class SpringAdvancedForecastingBot(ForecastBot):
             used.append("asknews")
         if ok("[LLM Web Research]", ["[LLM web research failed]"]):
             used.append("llm_web")
+        if ok("[Meta-Forecast]", ["[Meta-forecast unavailable]"]):
+            used.append("meta")
 
         return ",".join(used) if used else "none"
 
     def _ensure_some_research_or_raise(self, research: str) -> None:
-        """
-        We still enforce: do not forecast without *some* research.
-        But now "some research" can be from Tavily/Exa/AskNews OR the researcher LLM.
-        """
         if self._search_footprint(research) == "none":
-            raise RuntimeError(
-                "No research evidence available (all providers failed, and LLM web research failed)."
-            )
+            raise RuntimeError("No research evidence available (all providers and LLM fallback failed).")
 
     def _research_quality_weight(self, research: str) -> float:
+        """
+        Map count of sources -> a heuristic trust weight.
+        """
         srcs = self._search_footprint(research)
         if srcs == "none":
             return 0.25
         n = len(srcs.split(","))
-        return {1: 0.55, 2: 0.75, 3: 0.85, 4: 0.90}.get(n, 0.6)
+        return {1: 0.55, 2: 0.75, 3: 0.85, 4: 0.90, 5: 0.92}.get(n, 0.6)
 
     # ------------------------------------------
-    # Research
+    # Question decomposition (optional)
     # ------------------------------------------
 
-    async def _optimize_search_query(self, question: MetaculusQuestion) -> List[str]:
+    async def _decompose_question(self, question: MetaculusQuestion) -> Optional[DecompositionOutput]:
+        if not self.flags.enable_decomposition:
+            return None
+        try:
+            llm = self.get_llm("decomposer", "llm")
+            prompt = clean_indents(
+                f"""
+Decompose the following forecasting question into:
+- 3-6 subquestions that would help research it
+- key entities (people, orgs, products, locations)
+- key metrics (numbers or quantities to track)
+
+Return ONLY JSON with keys:
+{{"subquestions":[...], "key_entities":[...], "key_metrics":[...]}}
+
+Question:
+{question.question_text}
+
+Resolution criteria:
+{question.resolution_criteria}
+"""
+            )
+            raw = await llm.invoke(prompt)
+            return safe_model(DecompositionOutput, sanitize_llm_json(raw))
+        except Exception as e:
+            logger.warning(f"Question decomposition failed: {e}")
+            return None
+
+    # ------------------------------------------
+    # Meta-forecast (stub)
+    # ------------------------------------------
+
+    async def _run_meta_forecast_stub(self, question: MetaculusQuestion) -> str:
+        """
+        Stub hook for Metaforecast / other aggregators.
+        - If you implement this, return a text blob with external forecasts.
+        - Keep safe fallback behaviour.
+        """
+        if not self.flags.enable_meta_forecast:
+            return "[Meta-forecast unavailable]"
+        # TODO: implement actual calls (GraphQL, scrapers, etc.)
+        return "[Meta-Forecast]\n[Meta-forecast unavailable]"
+
+    # ------------------------------------------
+    # Search query optimization
+    # ------------------------------------------
+
+    async def _optimize_search_query(self, question: MetaculusQuestion, decomp: Optional[DecompositionOutput]) -> List[str]:
         llm = self.get_llm("query_optimizer", "llm")
+
+        extra = ""
+        if decomp and decomp.subquestions:
+            extra = "\nSubquestions:\n" + "\n".join(f"- {s}" for s in decomp.subquestions[:6])
+        if decomp and decomp.key_entities:
+            extra += "\nEntities:\n" + ", ".join(decomp.key_entities[:12])
+        if decomp and decomp.key_metrics:
+            extra += "\nMetrics:\n" + ", ".join(decomp.key_metrics[:12])
+
         prompt = f"""
 Rewrite this forecasting question into 3 precise, factual web search queries.
 Prefer entity names, key metrics, and date ranges.
 Question: {question.question_text}
+{extra}
+
 Output ONLY a JSON list: ["query1","query2","query3"]
 """.strip()
         try:
@@ -264,6 +416,10 @@ Output ONLY a JSON list: ["query1","query2","query3"]
             return cleaned[:3] if cleaned else [question.question_text[:160]]
         except Exception:
             return [question.question_text[:160]]
+
+    # ------------------------------------------
+    # External provider searches
+    # ------------------------------------------
 
     async def _run_tavily_search(self, query: str) -> str:
         if not self.tavily:
@@ -301,13 +457,21 @@ Output ONLY a JSON list: ["query1","query2","query3"]
             logger.error(f"AskNews search failed: {e}")
             return "[AskNews search failed]"
 
-    async def _run_llm_web_research(self, question: MetaculusQuestion) -> str:
+    async def _run_llm_web_research(self, question: MetaculusQuestion, decomp: Optional[DecompositionOutput]) -> str:
         """
-        Fallback research using the configured 'researcher' LLM.
-        This is used when external APIs aren't configured or fail.
+        Fallback research using the configured 'researcher' model, if web-enabled.
         """
         try:
             researcher = self.get_llm("researcher")
+            extra = ""
+            if decomp:
+                if decomp.subquestions:
+                    extra += "\nSubquestions:\n" + "\n".join(f"- {s}" for s in decomp.subquestions[:6])
+                if decomp.key_entities:
+                    extra += "\nEntities:\n" + ", ".join(decomp.key_entities[:12])
+                if decomp.key_metrics:
+                    extra += "\nMetrics:\n" + ", ".join(decomp.key_metrics[:12])
+
             prompt = clean_indents(
                 f"""
 You are an assistant to a superforecaster.
@@ -326,6 +490,7 @@ Resolution criteria:
 
 Fine print:
 {question.fine_print}
+{extra}
 """
             )
             if isinstance(researcher, GeneralLlm):
@@ -341,7 +506,16 @@ Fine print:
             return "[LLM web research failed]"
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        queries = await self._optimize_search_query(question)
+        """
+        Orchestrates research:
+        - optional decomposition
+        - provider searches
+        - fallback LLM web research
+        - optional meta-forecast stub
+        """
+        decomp = await self._decompose_question(question)
+
+        queries = await self._optimize_search_query(question, decomp)
         optimized_query = " OR ".join(queries)
 
         tasks = [
@@ -357,12 +531,16 @@ Fine print:
                 cleaned.append(f"[Search failed: {str(res)}]")
             else:
                 cleaned.append(res)
-
         combined = "\n\n".join(cleaned).strip()
 
         # If external providers aren't usable, fallback to LLM web research
         if self._search_footprint(combined) == "none":
-            combined = (combined + "\n\n" if combined else "") + await self._run_llm_web_research(question)
+            combined = (combined + "\n\n" if combined else "") + await self._run_llm_web_research(question, decomp)
+
+        # Optional meta-forecast hook
+        meta_block = await self._run_meta_forecast_stub(question)
+        if meta_block and "unavailable" not in meta_block.lower():
+            combined = combined + "\n\n" + meta_block
 
         base_rate = ForecastingPrinciples.get_generic_base_rate()
         fermi = ForecastingPrinciples.get_generic_fermi_prompt()
@@ -373,7 +551,6 @@ Fine print:
 
 {combined}"""
 
-        # Now enforce: we got *something* usable (providers OR LLM web research)
         self._ensure_some_research_or_raise(research)
         return research
 
@@ -472,7 +649,10 @@ Rules:
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             lo, hi = 0.0, 1.0
         w = {0.1: 0.05, 0.2: 0.15, 0.4: 0.40, 0.6: 0.60, 0.8: 0.85, 0.9: 0.95}
-        pcts = [Percentile(percentile=p, value=lo + (hi - lo) * w[p]) for p in [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]]
+        pcts = [
+            Percentile(percentile=p, value=lo + (hi - lo) * w[p])
+            for p in [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+        ]
         return SpringAdvancedForecastingBot._enforce_monotone(pcts)
 
     @staticmethod
@@ -560,7 +740,7 @@ Text:
         return self._bounds_fallback(question)
 
     # ------------------------------------------
-    # Forecasting
+    # Forecasting controls
     # ------------------------------------------
 
     def _get_temperature(self, question: MetaculusQuestion) -> float:
@@ -570,10 +750,106 @@ Text:
         qt = question.question_text.lower()
         if days_to_close > 180 or "first" in qt or "never before" in qt:
             return 0.35
-        return 0.1
+        return 0.10
+
+    def _agreement_strength(self, probs: List[float]) -> float:
+        """
+        Convert ensemble disagreement into a scalar in [0,1], where 1 means strong agreement.
+        """
+        if not probs:
+            return 0.0
+        spread = max(probs) - min(probs) if len(probs) > 1 else 0.0
+        # spread 0.00 -> 1.0; spread 0.35 -> ~0; clamp.
+        return float(np.clip(1.0 - (spread / 0.35), 0.0, 1.0))
+
+    def _extremize_strength(self, research: str, probs: List[float], question: MetaculusQuestion) -> float:
+        """
+        Decide extremization strength (logit multiplier).
+        - Driven by research quality + agreement.
+        - Dampened near close time to avoid last-minute overconfidence.
+        """
+        if not self.flags.enable_extremize:
+            return 1.0  # no change
+
+        quality = self._research_quality_weight(research)  # ~0.25..0.92
+        agree = self._agreement_strength(probs)           # 0..1
+
+        # Base: 1.0 (no change) -> up to ~1.8 when strong.
+        base = 1.0 + 0.9 * (quality - 0.5) * 2.0 * agree  # roughly up to ~1.8
+
+        # Dampening close to close_time
+        close_time = getattr(question, "close_time", None)
+        if close_time:
+            now = datetime.now(timezone.utc)
+            days = (close_time - now).days
+            if days < 14:
+                base = 1.0 + (base - 1.0) * 0.3
+            elif days < 60:
+                base = 1.0 + (base - 1.0) * 0.6
+
+        return float(np.clip(base, 0.9, 2.0))
+
+    async def _red_team_forecast(self, question: MetaculusQuestion, research: str, initial_pred: float) -> float:
+        self._ensure_some_research_or_raise(research)
+        try:
+            llm = self.get_llm("red_team", "llm")
+            response = await llm.invoke(
+                clean_indents(
+                    f"""
+You are a skeptical red teamer.
+
+Question: {question.question_text}
+Research:
+{research}
+
+Current forecast: {initial_pred:.2%}
+
+Output ONLY JSON:
+{{"revised_prediction_in_decimal": 0.XX}}
+"""
+                )
+            )
+            parsed = await structure_output(
+                sanitize_llm_json(response),
+                dict,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=1,
+            )
+            if isinstance(parsed, dict) and "revised_prediction_in_decimal" in parsed:
+                val = float(parsed["revised_prediction_in_decimal"])
+                return float(np.clip(val, 0.0, 1.0))
+        except Exception as e:
+            logger.warning(f"Red teaming failed: {e}")
+        return initial_pred
+
+    async def _check_consistency(self, question: MetaculusQuestion, proposed_pred: float) -> bool:
+        if len(self._recent_predictions) < 2:
+            return True
+        recent_summary = "\n".join(
+            [f"Q: {getattr(q, 'question_text', '')} → Pred: {p:.2%}" for q, p in self._recent_predictions[-3:]]
+        )
+        llm = self.get_llm("parser", "llm")
+        prompt = f"""
+Is this new forecast logically consistent with prior forecasts?
+
+New: {question.question_text} → {proposed_pred:.2%}
+
+Prior:
+{recent_summary}
+
+Answer YES or NO only.
+""".strip()
+        try:
+            response = await llm.invoke(prompt)
+            return "YES" in response.upper()
+        except Exception:
+            return True
+
+    # ------------------------------------------
+    # Model forecasts (per forecaster)
+    # ------------------------------------------
 
     async def _get_model_forecast(self, model_name: str, question: MetaculusQuestion, research: str) -> Any:
-        # Ensure we have *some* research (providers or LLM web research)
         self._ensure_some_research_or_raise(research)
 
         temp = self._get_temperature(question)
@@ -661,62 +937,39 @@ Percentile 90: XX
 
         raise TypeError(f"Unsupported question type: {type(question)}")
 
-    async def _red_team_forecast(self, question: MetaculusQuestion, research: str, initial_pred: float) -> float:
-        self._ensure_some_research_or_raise(research)
+    # ------------------------------------------
+    # Publishing-friendly short reasoning strings
+    # ------------------------------------------
 
-        try:
-            llm = self.get_llm("red_team", "llm")
-            response = await llm.invoke(
-                clean_indents(
-                    f"""
-You are a skeptical red teamer.
-
-Question: {question.question_text}
-Research:
-{research}
-
-Current forecast: {initial_pred:.2%}
-
-Output ONLY JSON:
-{{"revised_prediction_in_decimal": 0.XX}}
-"""
-                )
-            )
-            parsed = await structure_output(
-                sanitize_llm_json(response),
-                dict,
-                model=self.get_llm("parser", "llm"),
-                num_validation_samples=1,
-            )
-            if isinstance(parsed, dict) and "revised_prediction_in_decimal" in parsed:
-                val = float(parsed["revised_prediction_in_decimal"])
-                return float(np.clip(val, 0.0, 1.0))
-        except Exception as e:
-            logger.warning(f"Red teaming failed: {e}")
-        return initial_pred
-
-    async def _check_consistency(self, question: MetaculusQuestion, proposed_pred: float) -> bool:
-        if len(self._recent_predictions) < 2:
-            return True
-        recent_summary = "\n".join(
-            [f"Q: {getattr(q, 'question_text', '')} → Pred: {p:.2%}" for q, p in self._recent_predictions[-3:]]
+    def _short_reasoning_binary(
+        self,
+        research: str,
+        final_p: float,
+        raw_p: float,
+        red_p: float,
+        extremized_p: float,
+        spread: float,
+        quality: float,
+        applied: List[str],
+    ) -> str:
+        src = self._search_footprint(research)
+        applied_txt = ", ".join(applied) if applied else "none"
+        return (
+            f"[{self.bot_name}] approach: multi-source research({src}); 3-model ensemble→critic→red-team; "
+            f"controls({applied_txt}); final={final_p:.3f} (critic={raw_p:.3f}, red={red_p:.3f}, ext={extremized_p:.3f}, spread={spread:.3f}, q={quality:.2f})"
         )
-        llm = self.get_llm("parser", "llm")
-        prompt = f"""
-Is this new forecast logically consistent with prior forecasts?
 
-New: {question.question_text} → {proposed_pred:.2%}
+    def _short_reasoning_mc(self, research: str, avg_prob: float) -> str:
+        src = self._search_footprint(research)
+        return f"[{self.bot_name}] approach: research({src}); 3-model ensemble→critic; normalized options; avg_prob={avg_prob:.3f}"
 
-Prior:
-{recent_summary}
+    def _short_reasoning_numeric(self, research: str, median_proxy: float) -> str:
+        src = self._search_footprint(research)
+        return f"[{self.bot_name}] approach: research({src}); 3-model ensemble→critic; parsed percentiles; median≈{median_proxy:g}"
 
-Answer YES or NO only.
-""".strip()
-        try:
-            response = await llm.invoke(prompt)
-            return "YES" in response.upper()
-        except Exception:
-            return True
+    # ------------------------------------------
+    # Forecasting: Binary
+    # ------------------------------------------
 
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
         self._ensure_some_research_or_raise(research)
@@ -728,13 +981,12 @@ Answer YES or NO only.
         ]
 
         results = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
-        forecast_map: Dict[str, float] = {
-            f"model_{i}": float(r.prediction_in_decimal) for i, r in enumerate(results)
-        }
+        model_probs = [float(r.prediction_in_decimal) for r in results]
+        forecast_map: Dict[str, float] = {f"model_{i}": float(r.prediction_in_decimal) for i, r in enumerate(results)}
 
-        vals = list(forecast_map.values()) or [0.5]
-        spread = (max(vals) - min(vals)) if len(vals) > 1 else 0.0
+        spread = (max(model_probs) - min(model_probs)) if len(model_probs) > 1 else 0.0
 
+        # Critic aggregates
         critic_llm = self.get_llm("critic", "llm")
         critique = await critic_llm.invoke(
             clean_indents(
@@ -760,32 +1012,70 @@ OUTPUT ONLY JSON:
         )
         raw_p = float(critic_out.prediction_in_decimal)
 
+        # Red-team adjusts
         red_teamed_p = await self._red_team_forecast(question, research, raw_p)
         averaged_p = 0.5 * (raw_p + red_teamed_p)
 
+        applied: List[str] = []
+
+        # Disagreement shrink
         if spread >= 0.35:
             averaged_p = 0.6 * averaged_p + 0.4 * 0.5
+            applied.append("high-spread-shrink")
         elif spread >= 0.20:
             averaged_p = 0.8 * averaged_p + 0.2 * 0.5
+            applied.append("med-spread-shrink")
 
+        # Consistency check
         if not await self._check_consistency(question, averaged_p):
             averaged_p = 0.5 * averaged_p + 0.5 * 0.5
+            applied.append("consistency-shrink")
 
+        # Blend with community if present (research-quality weighted)
         community = getattr(question, "community_prediction", None)
         quality = self._research_quality_weight(research)
         blended_p = (quality * averaged_p + (1 - quality) * float(community)) if (community is not None) else averaged_p
+        if community is not None:
+            applied.append("community-blend")
 
-        final_p = ForecastingPrinciples.apply_time_decay(blended_p, getattr(question, "close_time", None))
-        final_p = self.apply_bayesian_calibration(final_p * 100) / 100.0
-        final_p = float(np.clip(final_p, 0.01, 0.99))
+        # Extremize (optional)
+        ext_strength = self._extremize_strength(research, model_probs + [raw_p, red_teamed_p], question)
+        p_ext = ForecastingPrinciples.extremize_logit(blended_p, ext_strength)
+        if self.flags.enable_extremize and abs(ext_strength - 1.0) > 0.05:
+            applied.append(f"extremize(x{ext_strength:.2f})")
 
+        # Time decay (anti-extremize far from close)
+        p_time = ForecastingPrinciples.apply_time_decay(p_ext, getattr(question, "close_time", None))
+        if p_time != p_ext:
+            applied.append("time-decay")
+
+        # Calibration (from ForecastBot base, if implemented)
+        try:
+            p_cal = self.apply_bayesian_calibration(p_time * 100) / 100.0
+            if p_cal != p_time:
+                applied.append("bayes-calibration")
+        except Exception:
+            p_cal = p_time
+
+        final_p = float(np.clip(p_cal, 0.01, 0.99))
         self._recent_predictions.append((question, final_p))
 
-        comment = (
-            f"final={final_p:.3f} critic={raw_p:.3f} red={red_teamed_p:.3f} "
-            f"spread={spread:.3f} search={self._search_footprint(research)}"
+        reasoning = self._short_reasoning_binary(
+            research=research,
+            final_p=final_p,
+            raw_p=raw_p,
+            red_p=red_teamed_p,
+            extremized_p=p_ext,
+            spread=spread,
+            quality=quality,
+            applied=applied,
         )
-        return ReasonedPrediction(prediction_value=final_p, reasoning=comment)
+
+        return ReasonedPrediction(prediction_value=final_p, reasoning=reasoning)
+
+    # ------------------------------------------
+    # Forecasting: Multiple choice
+    # ------------------------------------------
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
@@ -845,7 +1135,12 @@ OUTPUT ONLY JSON:
         avg_prob = float(np.mean([o["probability"] for o in aligned])) if aligned else 0.0
         self._recent_predictions.append((question, avg_prob))
 
-        return ReasonedPrediction(prediction_value=final_val, reasoning=f"search={self._search_footprint(research)}")
+        reasoning = self._short_reasoning_mc(research, avg_prob)
+        return ReasonedPrediction(prediction_value=final_val, reasoning=reasoning)
+
+    # ------------------------------------------
+    # Forecasting: Numeric
+    # ------------------------------------------
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
@@ -857,7 +1152,9 @@ OUTPUT ONLY JSON:
             "openrouter/openai/gpt-5",
             "openrouter/anthropic/claude-4.5-sonnet",
         ]
-        results: List[List[Percentile]] = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
+        results: List[List[Percentile]] = await asyncio.gather(
+            *[self._get_model_forecast(m, question, research) for m in forecasters]
+        )
 
         forecast_map = {
             f"model_{i}": [{"percentile": float(p.percentile), "value": float(p.value)} for p in r]
@@ -908,17 +1205,16 @@ Percentile 90: XX
         dist = NumericDistribution.from_question(final_pcts, question)
         median_proxy = self._median_from_40_60(final_pcts)
 
+        # store a bounded scalar for consistency check purposes
         self._recent_predictions.append((question, float(median_proxy / (abs(median_proxy) + 1.0)) if median_proxy else 0.0))
 
-        return ReasonedPrediction(
-            prediction_value=dist,
-            reasoning=f"search={self._search_footprint(research)} median≈{median_proxy:g}",
-        )
+        reasoning = self._short_reasoning_numeric(research, median_proxy)
+        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
 
 
-# ==========================================
+# =========================================================
 # 🚀 MAIN EXECUTION
-# ==========================================
+# =========================================================
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -926,7 +1222,7 @@ if __name__ == "__main__":
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    parser = argparse.ArgumentParser(description="Run the General-Purpose Advanced Forecasting Bot")
+    parser = argparse.ArgumentParser(description="Run the Advanced Forecasting Bot (botduke)")
     parser.add_argument(
         "--mode",
         type=str,
@@ -934,8 +1230,19 @@ if __name__ == "__main__":
         default="tournament",
         help="Specify the run mode (default: tournament)",
     )
+    parser.add_argument("--bot-name", type=str, default="botduke", help="Bot display name for reasoning strings")
+    parser.add_argument("--no-extremize", action="store_true", help="Disable extremization")
+    parser.add_argument("--no-decomposition", action="store_true", help="Disable question decomposition")
+    parser.add_argument("--meta-forecast", action="store_true", help="Enable meta-forecast hook (stub)")
+
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
+
+    flags = BotFeatureFlags(
+        enable_extremize=not args.no_extremize,
+        enable_decomposition=not args.no_decomposition,
+        enable_meta_forecast=args.meta_forecast,
+    )
 
     bot = SpringAdvancedForecastingBot(
         research_reports_per_question=1,
@@ -944,6 +1251,8 @@ if __name__ == "__main__":
         publish_reports_to_metaculus=True,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
+        bot_name=args.bot_name,
+        flags=flags,
     )
 
     client = MetaculusClient()
@@ -965,7 +1274,7 @@ if __name__ == "__main__":
                 client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
             )
 
-        # test_questions: include Market Pulse 26Q1 + sample URLs
+        # test_questions
         bot.skip_previously_forecasted_questions = False
 
         EXAMPLE_QUESTION_URLS = [
