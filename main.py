@@ -1,40 +1,4 @@
 #!/usr/bin/env python3
-"""
-spring_advanced_forecasting_bot_updated.py
-
-Updated SpringAdvancedForecastingBot with these practical improvements:
-
-1) Short, user-facing reasoning string for each forecast:
-   - Approach summary (research sources used, ensemble + critic + red-team)
-   - Key aggregation controls applied (spread shrink, consistency check, extremize, calibration, time-decay, blending)
-   - Final forecast value (or median proxy for numeric, avg prob for MC)
-
-2) Extremization (optional, enabled by default):
-   - Applies a logistic/log-odds extremizing transform that pushes probabilities
-     away from 0.5 when research strength and model agreement are strong.
-   - Dampens extremization when research is weak, or models disagree, or near close time.
-
-3) Question decomposition (optional):
-   - Light decomposition to produce better search queries + research framing.
-   - Does NOT change Metaculus resolution criteria; only helps research/analysis.
-
-4) Meta-forecast integration (stub, optional):
-   - Placeholder hook for Metaforecast or other aggregators.
-   - Safely no-ops unless enabled and implemented.
-
-5) “bot name” set to botduke:
-   - Exposed via --bot-name; default is "botduke".
-
-Notes:
-- This file assumes the original `forecasting_tools` library is installed and
-  compatible with these imports.
-- External search APIs (Tavily/Exa/AskNews) remain optional; fallback LLM web research
-  is used if configured.
-- The code is designed to be run as a script in CI/GitHub, and to publish
-  reports to Metaculus if enabled.
-
-"""
-
 import argparse
 import asyncio
 import logging
@@ -42,7 +6,8 @@ import os
 import re
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
@@ -63,7 +28,7 @@ from forecasting_tools import (
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
-    Percentile,  # expects percentile in [0,1]
+    Percentile,
     BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
@@ -78,17 +43,7 @@ LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 
 
-# =========================================================
-# 🛡️ DATA SANITIZATION UTILITIES
-# =========================================================
-
 def sanitize_llm_json(text: str) -> str:
-    """
-    Attempts to clean up common LLM JSON output issues:
-    - remove numeric underscores in numbers (e.g., 1_000 -> 1000)
-    - coerce some quoted numeric fields into proper numbers
-    - strip ```json fences
-    """
     text = re.sub(r"(?<=\d)_(?=\d)", "", text)
 
     def clean_num(match):
@@ -97,7 +52,7 @@ def sanitize_llm_json(text: str) -> str:
         return f"\"{match.group(1)}\": {nums[0]}" if nums else match.group(0)
 
     text = re.sub(
-        r"\"(value|percentile|probability|prediction_in_decimal|revised_prediction_in_decimal)\":\s*\"([^\"]+)\"",
+        r"\"(value|percentile|probability|prediction_in_decimal|revised_prediction_in_decimal|multiplier|delta)\":\s*\"([^\"]+)\"",
         clean_num,
         text,
     )
@@ -111,9 +66,6 @@ def sanitize_llm_json(text: str) -> str:
 
 
 def safe_model(model_cls: type[BaseModel], data: Any) -> BaseModel:
-    """
-    Validate/coerce incoming data into a Pydantic model with helpful logging.
-    """
     try:
         if isinstance(data, model_cls):
             return data
@@ -125,26 +77,14 @@ def safe_model(model_cls: type[BaseModel], data: Any) -> BaseModel:
             return model_cls.model_validate(data)
         return model_cls(**data)
     except Exception as e:
-        logger.error(f"❌ MODEL INSTANTIATION FAILED for {model_cls.__name__}: {e}")
+        logger.error(f"MODEL INSTANTIATION FAILED for {model_cls.__name__}: {e}")
         raise
 
 
-# =========================================================
-# ✅ RAW MODELS TO AVOID Percentile VALIDATION ERRORS
-# =========================================================
-
 class RawPercentile(BaseModel):
-    """
-    Accepts percentiles as 10/20/... or 0.1/0.2/... and values as floats.
-    We'll normalize to forecasting_tools.Percentile (percentile in [0,1]) later.
-    """
-    percentile: float = Field(..., description="Percentile as 10/20/... or 0.1/0.2/...")
+    percentile: float
     value: float
 
-
-# =========================================================
-# 🔍 EXA SEARCH CLIENT
-# =========================================================
 
 class ExaSearcher:
     def __init__(self):
@@ -179,10 +119,6 @@ class ExaSearcher:
             return "[Exa search failed]"
 
 
-# =========================================================
-# 🧠 FORECASTING PRINCIPLES + EXTREMIZATION
-# =========================================================
-
 class ForecastingPrinciples:
     @staticmethod
     def get_generic_base_rate() -> str:
@@ -193,35 +129,30 @@ class ForecastingPrinciples:
 
     @staticmethod
     def get_generic_fermi_prompt() -> str:
-        return """
-FERMI GUIDANCE:
-1) Define the target quantity precisely.
-2) Decompose into drivers/factors.
-3) Estimate each factor using available evidence.
-4) Combine factors algebraically.
-5) Quantify uncertainty; keep intervals wide unless evidence is strong.
-""".strip()
+        return (
+            "FERMI GUIDANCE:\n"
+            "1) Define the target quantity precisely.\n"
+            "2) Decompose into drivers/factors.\n"
+            "3) Estimate each factor using available evidence.\n"
+            "4) Combine factors algebraically.\n"
+            "5) Quantify uncertainty; keep intervals wide unless evidence is strong."
+        )
 
     @staticmethod
     def apply_time_decay(prob: float, close_time: Optional[datetime]) -> float:
-        """
-        If far from close, gently shrink toward 0.5.
-        (This is *anti-extremizing*, so we balance it with optional extremization.)
-        """
         if close_time is None:
             return prob
         now = datetime.now(timezone.utc)
         if close_time.tzinfo is None:
             close_time = close_time.replace(tzinfo=timezone.utc)
-        days = (close_time - now).days
+        days = max(0.0, (close_time - now).total_seconds() / 86400.0)
         if days > 365:
             return 0.3 * prob + 0.7 * 0.5
-        elif days > 180:
+        if days > 180:
             return 0.5 * prob + 0.5 * 0.5
-        elif days > 90:
+        if days > 90:
             return 0.7 * prob + 0.3 * 0.5
-        else:
-            return prob
+        return prob
 
     @staticmethod
     def logit(p: float) -> float:
@@ -234,17 +165,9 @@ FERMI GUIDANCE:
 
     @classmethod
     def extremize_logit(cls, p: float, strength: float) -> float:
-        """
-        Logistic/log-odds extremization: p' = sigmoid(strength * logit(p))
-        strength > 1 pushes away from 0.5; strength < 1 shrinks toward 0.5.
-        """
         strength = float(np.clip(strength, 0.5, 3.0))
         return float(np.clip(cls.sigmoid(strength * cls.logit(p)), 0.0, 1.0))
 
-
-# =========================================================
-# 🧩 OPTIONAL: QUESTION DECOMPOSITION MODEL
-# =========================================================
 
 class DecompositionOutput(BaseModel):
     subquestions: List[str] = Field(default_factory=list)
@@ -252,43 +175,61 @@ class DecompositionOutput(BaseModel):
     key_metrics: List[str] = Field(default_factory=list)
 
 
-# =========================================================
-# 🤖 UPDATED BOT
-# =========================================================
+class NumericRegime(str, Enum):
+    LOOKUP = "lookup"
+    PARTIAL_REVEAL_SUM = "partial_reveal_sum"
+    STRUCTURED_TS = "structured_ts"
+    GENERIC = "generic"
+
+
+class PartialRevealExtract(BaseModel):
+    known_subtotal: Optional[float] = None
+    known_parts: Optional[int] = Field(default=None, ge=0)
+    total_parts: Optional[int] = Field(default=None, ge=1)
+    notes: Optional[str] = None
+
+
+class ReferenceClassExtract(BaseModel):
+    reference_totals: List[float] = Field(default_factory=list)
+    trend_multiplier: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class LevelSeriesExtract(BaseModel):
+    current_value: Optional[float] = None
+    current_date: Optional[str] = None
+    recent_values: List[float] = Field(default_factory=list)
+    notes: Optional[str] = None
+
+
+class BoundedMultiplier(BaseModel):
+    multiplier: float
+
+
+class BoundedDelta(BaseModel):
+    delta: float
+
 
 @dataclass
 class BotFeatureFlags:
     enable_extremize: bool = True
     enable_decomposition: bool = True
     enable_meta_forecast: bool = False
+    enable_numeric_regimes: bool = True
 
 
 class SpringAdvancedForecastingBot(ForecastBot):
-    """
-    An updated ForecastBot with:
-    - Robust multi-source research (Tavily/Exa/AskNews + LLM web fallback).
-    - Ensemble forecasters + critic + red-team.
-    - Optional extremization (logit-based), driven by research quality + agreement.
-    - Short, final reasoning comment (for Metaculus submission).
-    """
-
-    _structure_output_validation_samples = 2
+    _structure_output_validation_samples = 1
 
     def __init__(self, *args, bot_name: str = "botduke", flags: Optional[BotFeatureFlags] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.bot_name = bot_name
         self.flags = flags or BotFeatureFlags()
-
         self.tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY")) if os.getenv("TAVILY_API_KEY") else None
         self.exa_searcher = ExaSearcher() if os.getenv("EXA_API_KEY") else None
         self.asknews_client_id = os.getenv("ASKNEWS_CLIENT_ID")
         self.asknews_client_secret = os.getenv("ASKNEWS_CLIENT_SECRET")
-
         self._recent_predictions: list[tuple[MetaculusQuestion, float]] = []
-
-    # ------------------------------------------
-    # LLM Config
-    # ------------------------------------------
 
     def _llm_config_defaults(self) -> Dict[str, str]:
         return {
@@ -301,10 +242,6 @@ class SpringAdvancedForecastingBot(ForecastBot):
             "red_team": "openrouter/openai/gpt-4o",
             "decomposer": "openrouter/openai/gpt-4o-mini",
         }
-
-    # ------------------------------------------
-    # Research footprint + gating
-    # ------------------------------------------
 
     def _search_footprint(self, research: str) -> str:
         used: list[str] = []
@@ -330,18 +267,11 @@ class SpringAdvancedForecastingBot(ForecastBot):
             raise RuntimeError("No research evidence available (all providers and LLM fallback failed).")
 
     def _research_quality_weight(self, research: str) -> float:
-        """
-        Map count of sources -> a heuristic trust weight.
-        """
         srcs = self._search_footprint(research)
         if srcs == "none":
             return 0.25
         n = len(srcs.split(","))
         return {1: 0.55, 2: 0.75, 3: 0.85, 4: 0.90, 5: 0.92}.get(n, 0.6)
-
-    # ------------------------------------------
-    # Question decomposition (optional)
-    # ------------------------------------------
 
     async def _decompose_question(self, question: MetaculusQuestion) -> Optional[DecompositionOutput]:
         if not self.flags.enable_decomposition:
@@ -366,33 +296,18 @@ Resolution criteria:
 """
             )
             raw = await llm.invoke(prompt)
-            return safe_model(DecompositionOutput, sanitize_llm_json(raw))
+            return safe_model(DecompositionOutput, sanitize_llm_json(raw))  # type: ignore[return-value]
         except Exception as e:
             logger.warning(f"Question decomposition failed: {e}")
             return None
 
-    # ------------------------------------------
-    # Meta-forecast (stub)
-    # ------------------------------------------
-
     async def _run_meta_forecast_stub(self, question: MetaculusQuestion) -> str:
-        """
-        Stub hook for Metaforecast / other aggregators.
-        - If you implement this, return a text blob with external forecasts.
-        - Keep safe fallback behaviour.
-        """
         if not self.flags.enable_meta_forecast:
             return "[Meta-forecast unavailable]"
-        # TODO: implement actual calls (GraphQL, scrapers, etc.)
         return "[Meta-Forecast]\n[Meta-forecast unavailable]"
-
-    # ------------------------------------------
-    # Search query optimization
-    # ------------------------------------------
 
     async def _optimize_search_query(self, question: MetaculusQuestion, decomp: Optional[DecompositionOutput]) -> List[str]:
         llm = self.get_llm("query_optimizer", "llm")
-
         extra = ""
         if decomp and decomp.subquestions:
             extra = "\nSubquestions:\n" + "\n".join(f"- {s}" for s in decomp.subquestions[:6])
@@ -416,10 +331,6 @@ Output ONLY a JSON list: ["query1","query2","query3"]
             return cleaned[:3] if cleaned else [question.question_text[:160]]
         except Exception:
             return [question.question_text[:160]]
-
-    # ------------------------------------------
-    # External provider searches
-    # ------------------------------------------
 
     async def _run_tavily_search(self, query: str) -> str:
         if not self.tavily:
@@ -458,9 +369,6 @@ Output ONLY a JSON list: ["query1","query2","query3"]
             return "[AskNews search failed]"
 
     async def _run_llm_web_research(self, question: MetaculusQuestion, decomp: Optional[DecompositionOutput]) -> str:
-        """
-        Fallback research using the configured 'researcher' model, if web-enabled.
-        """
         try:
             researcher = self.get_llm("researcher")
             extra = ""
@@ -506,15 +414,7 @@ Fine print:
             return "[LLM web research failed]"
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        """
-        Orchestrates research:
-        - optional decomposition
-        - provider searches
-        - fallback LLM web research
-        - optional meta-forecast stub
-        """
         decomp = await self._decompose_question(question)
-
         queries = await self._optimize_search_query(question, decomp)
         optimized_query = " OR ".join(queries)
 
@@ -533,46 +433,36 @@ Fine print:
                 cleaned.append(res)
         combined = "\n\n".join(cleaned).strip()
 
-        # If external providers aren't usable, fallback to LLM web research
         if self._search_footprint(combined) == "none":
             combined = (combined + "\n\n" if combined else "") + await self._run_llm_web_research(question, decomp)
 
-        # Optional meta-forecast hook
         meta_block = await self._run_meta_forecast_stub(question)
         if meta_block and "unavailable" not in meta_block.lower():
             combined = combined + "\n\n" + meta_block
 
-        base_rate = ForecastingPrinciples.get_generic_base_rate()
-        fermi = ForecastingPrinciples.get_generic_fermi_prompt()
+        research = f"""{ForecastingPrinciples.get_generic_base_rate()}
 
-        research = f"""{base_rate}
-
-{fermi}
+{ForecastingPrinciples.get_generic_fermi_prompt()}
 
 {combined}"""
 
         self._ensure_some_research_or_raise(research)
         return research
 
-    # ------------------------------------------
-    # Numeric helpers
-    # ------------------------------------------
-
     def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> Tuple[str, str]:
         upper = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
         lower = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
         unit = question.unit_of_measure or ""
-
-        if getattr(question, "open_upper_bound", False):
-            upper_msg = f"The question creator thinks the number is likely not higher than {upper} {unit}."
-        else:
-            upper_msg = f"The outcome can not be higher than {upper} {unit}."
-
-        if getattr(question, "open_lower_bound", False):
-            lower_msg = f"The question creator thinks the number is likely not lower than {lower} {unit}."
-        else:
-            lower_msg = f"The outcome can not be lower than {lower} {unit}."
-
+        upper_msg = (
+            f"The question creator thinks the number is likely not higher than {upper} {unit}."
+            if getattr(question, "open_upper_bound", False)
+            else f"The outcome can not be higher than {upper} {unit}."
+        )
+        lower_msg = (
+            f"The question creator thinks the number is likely not lower than {lower} {unit}."
+            if getattr(question, "open_lower_bound", False)
+            else f"The outcome can not be lower than {lower} {unit}."
+        )
         return upper_msg, lower_msg
 
     def _numeric_parsing_instructions(self, question: NumericQuestion) -> str:
@@ -649,10 +539,7 @@ Rules:
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             lo, hi = 0.0, 1.0
         w = {0.1: 0.05, 0.2: 0.15, 0.4: 0.40, 0.6: 0.60, 0.8: 0.85, 0.9: 0.95}
-        pcts = [
-            Percentile(percentile=p, value=lo + (hi - lo) * w[p])
-            for p in [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
-        ]
+        pcts = [Percentile(percentile=p, value=lo + (hi - lo) * w[p]) for p in [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]]
         return SpringAdvancedForecastingBot._enforce_monotone(pcts)
 
     @staticmethod
@@ -662,10 +549,15 @@ Rules:
             return 0.5 * (by[0.4] + by[0.6])
         return float(sorted(pcts, key=lambda x: x.percentile)[len(pcts) // 2].value) if pcts else 0.0
 
+    @staticmethod
+    def _p10_p90(pcts: List[Percentile]) -> Tuple[Optional[float], Optional[float]]:
+        by = {round(float(p.percentile), 3): float(p.value) for p in pcts}
+        return by.get(0.1), by.get(0.9)
+
     async def _parse_numeric_percentiles_robust(self, question: NumericQuestion, text: str, stage: str) -> List[Percentile]:
         parser_llm = self.get_llm("parser", "llm")
         instructions = self._numeric_parsing_instructions(question)
-        numeric_validation_samples = 1  # avoid sampled-output mismatch
+        numeric_validation_samples = 1
 
         try:
             raw1: List[RawPercentile] = await structure_output(
@@ -739,10 +631,6 @@ Text:
         logger.warning(f"[{stage}] numeric parsing failed; using bounds fallback.")
         return self._bounds_fallback(question)
 
-    # ------------------------------------------
-    # Forecasting controls
-    # ------------------------------------------
-
     def _get_temperature(self, question: MetaculusQuestion) -> float:
         if not getattr(question, "close_time", None):
             return 0.35
@@ -753,31 +641,17 @@ Text:
         return 0.10
 
     def _agreement_strength(self, probs: List[float]) -> float:
-        """
-        Convert ensemble disagreement into a scalar in [0,1], where 1 means strong agreement.
-        """
         if not probs:
             return 0.0
         spread = max(probs) - min(probs) if len(probs) > 1 else 0.0
-        # spread 0.00 -> 1.0; spread 0.35 -> ~0; clamp.
         return float(np.clip(1.0 - (spread / 0.35), 0.0, 1.0))
 
     def _extremize_strength(self, research: str, probs: List[float], question: MetaculusQuestion) -> float:
-        """
-        Decide extremization strength (logit multiplier).
-        - Driven by research quality + agreement.
-        - Dampened near close time to avoid last-minute overconfidence.
-        """
         if not self.flags.enable_extremize:
-            return 1.0  # no change
-
-        quality = self._research_quality_weight(research)  # ~0.25..0.92
-        agree = self._agreement_strength(probs)           # 0..1
-
-        # Base: 1.0 (no change) -> up to ~1.8 when strong.
-        base = 1.0 + 0.9 * (quality - 0.5) * 2.0 * agree  # roughly up to ~1.8
-
-        # Dampening close to close_time
+            return 1.0
+        quality = self._research_quality_weight(research)
+        agree = self._agreement_strength(probs)
+        base = 1.0 + 0.9 * (quality - 0.5) * 2.0 * agree
         close_time = getattr(question, "close_time", None)
         if close_time:
             now = datetime.now(timezone.utc)
@@ -786,7 +660,6 @@ Text:
                 base = 1.0 + (base - 1.0) * 0.3
             elif days < 60:
                 base = 1.0 + (base - 1.0) * 0.6
-
         return float(np.clip(base, 0.9, 2.0))
 
     async def _red_team_forecast(self, question: MetaculusQuestion, research: str, initial_pred: float) -> float:
@@ -845,13 +718,392 @@ Answer YES or NO only.
         except Exception:
             return True
 
-    # ------------------------------------------
-    # Model forecasts (per forecaster)
-    # ------------------------------------------
+    def _methodology_header(self, research: str) -> str:
+        src = self._search_footprint(research)
+        return (
+            f"[{self.bot_name}] methodology: multi-source research({src}); "
+            f"numeric regime routing + constrained aggregation; "
+            f"LLM used for bounded adjustments only in structured regimes."
+        )
+
+    def _numeric_summary_line(self, pcts: List[Percentile]) -> str:
+        med = self._median_from_40_60(pcts)
+        p10, p90 = self._p10_p90(pcts)
+        if p10 is not None and p90 is not None:
+            return f"final summary: median≈{med:.6g}, 10–90≈[{p10:.6g},{p90:.6g}]"
+        return f"final summary: median≈{med:.6g}"
+
+    def _short_reasoning_binary(
+        self,
+        research: str,
+        final_p: float,
+        raw_p: float,
+        red_p: float,
+        extremized_p: float,
+        spread: float,
+        quality: float,
+        applied: List[str],
+    ) -> str:
+        applied_txt = ", ".join(applied) if applied else "none"
+        return (
+            f"{self._methodology_header(research)} "
+            f"Binary: 3-model ensemble→critic→red-team; controls({applied_txt}). "
+            f"final={final_p:.3f} (critic={raw_p:.3f}, red={red_p:.3f}, ext={extremized_p:.3f}, spread={spread:.3f}, q={quality:.2f})."
+        )
+
+    def _short_reasoning_mc(self, research: str, avg_prob: float) -> str:
+        return (
+            f"{self._methodology_header(research)} "
+            f"MC: 3-model ensemble→critic; aligned+normalized option probs. final avg_prob={avg_prob:.3f}."
+        )
+
+    def _short_reasoning_numeric_generic(self, research: str, pcts: List[Percentile]) -> str:
+        return (
+            f"{self._methodology_header(research)} "
+            f"Numeric(generic): 3-model ensemble→critic; parsed standard percentiles; monotone enforced. "
+            f"{self._numeric_summary_line(pcts)}."
+        )
+
+    def _extract_date_range_generic(self, text: str) -> Optional[Tuple[date, date]]:
+        m = re.search(
+            r"\(\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\s*-\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\s*\)",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return None
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                start = datetime.strptime(m.group(1), fmt).date()
+                end = datetime.strptime(m.group(2), fmt).date()
+                if start > end:
+                    start, end = end, start
+                return start, end
+            except Exception:
+                continue
+        return None
+
+    def _has_partial_observations(self, research: str, question: NumericQuestion) -> bool:
+        r = (research or "").lower()
+        cues = ["sum to", "subtotal", "observed", "published", "known days", "so far", "remaining", "hinges on", "partial", "to date"]
+        return (any(c in r for c in cues) and self._extract_date_range_generic(question.question_text or "") is not None)
+
+    def _regex_extract_known_subtotal(self, research: str) -> Optional[float]:
+        pats = [
+            r"sum to\s+([\d,]+(?:\.\d+)?)",
+            r"subtotal[:\s]+([\d,]+(?:\.\d+)?)",
+            r"known (?:subtotal|total)[:\s]+([\d,]+(?:\.\d+)?)",
+            r"published (?:days|values) .*?sum(?:s)? to\s+([\d,]+(?:\.\d+)?)",
+        ]
+        for pat in pats:
+            m = re.search(pat, research or "", flags=re.IGNORECASE)
+            if m:
+                try:
+                    v = float(m.group(1).replace(",", ""))
+                    if v > 0:
+                        return v
+                except Exception:
+                    pass
+        return None
+
+    def _is_level_series_question(self, question: NumericQuestion) -> bool:
+        qt = (question.question_text or "").lower()
+        return any(k in qt for k in ["ending value", "end value", "closing value", "close value", "as of"])
+
+    def _horizon_days_from_text(self, question: NumericQuestion) -> Optional[int]:
+        dr = self._extract_date_range_generic(question.question_text or "")
+        if not dr:
+            return None
+        start, end = dr
+        return (end - start).days + 1
+
+    def _detect_numeric_regime(self, question: NumericQuestion, research: str) -> NumericRegime:
+        if not self.flags.enable_numeric_regimes:
+            return NumericRegime.GENERIC
+        qt = (question.question_text or "").lower()
+        dr = self._extract_date_range_generic(question.question_text or "")
+        if "according to" in qt and any(w in qt for w in ["was", "were", "did", "have"]):
+            if dr:
+                _, end = dr
+                if end < datetime.now(timezone.utc).date():
+                    return NumericRegime.LOOKUP
+        if self._has_partial_observations(research, question):
+            return NumericRegime.PARTIAL_REVEAL_SUM
+        if dr:
+            start, end = dr
+            horizon = (end - start).days + 1
+            if 2 <= horizon <= 31:
+                return NumericRegime.STRUCTURED_TS
+        if self._is_level_series_question(question):
+            return NumericRegime.STRUCTURED_TS
+        return NumericRegime.GENERIC
+
+    @staticmethod
+    def _normal_percentiles_from_mean_sd(mean: float, sd: float) -> List[Percentile]:
+        z = {0.1: -1.2816, 0.2: -0.8416, 0.4: -0.2533, 0.6: 0.2533, 0.8: 0.8416, 0.9: 1.2816}
+        out: List[Percentile] = []
+        for p in [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]:
+            val = mean + z[p] * sd
+            out.append(Percentile(percentile=p, value=float(val)))
+        return SpringAdvancedForecastingBot._enforce_monotone(out)
+
+    async def _bounded_multiplier(self, question: NumericQuestion, research: str, baseline: float, *, lo: float, hi: float) -> float:
+        critic = self.get_llm("critic", "llm")
+        prompt = clean_indents(f"""
+Return JSON only: {{"multiplier": 1.00}}
+
+Question: {question.question_text}
+
+Baseline: {baseline}
+
+Research:
+{research}
+
+Rules:
+- multiplier must be within [{lo:.6f}, {hi:.6f}]
+- Output only JSON.
+""")
+        raw = await critic.invoke(prompt)
+        model = safe_model(BoundedMultiplier, sanitize_llm_json(raw))  # type: ignore[arg-type]
+        m = float(getattr(model, "multiplier"))
+        return float(np.clip(m, lo, hi))
+
+    async def _bounded_delta(self, question: NumericQuestion, research: str, baseline_level: float, *, lo: float, hi: float) -> float:
+        critic = self.get_llm("critic", "llm")
+        prompt = clean_indents(f"""
+Return JSON only: {{"delta": 0.00}}
+
+Question: {question.question_text}
+
+Baseline level: {baseline_level}
+
+Research:
+{research}
+
+Rules:
+- delta must be within [{lo:.6f}, {hi:.6f}]
+- Output only JSON.
+""")
+        raw = await critic.invoke(prompt)
+        model = safe_model(BoundedDelta, sanitize_llm_json(raw))  # type: ignore[arg-type]
+        d = float(getattr(model, "delta"))
+        return float(np.clip(d, lo, hi))
+
+    async def _llm_extract_partial_reveal(self, question: NumericQuestion, research: str) -> PartialRevealExtract:
+        parser = self.get_llm("parser", "llm")
+        prompt = clean_indents(f"""
+Return JSON only:
+{{"known_subtotal": null, "known_parts": null, "total_parts": null, "notes": null}}
+
+Question:
+{question.question_text}
+
+Research:
+{research}
+
+Extract:
+- known_subtotal if research states a subtotal/sum for observed parts
+- known_parts and total_parts if inferable
+""")
+        raw = await parser.invoke(prompt)
+        return safe_model(PartialRevealExtract, sanitize_llm_json(raw))  # type: ignore[return-value]
+
+    async def _llm_extract_reference_class(self, question: NumericQuestion, research: str) -> ReferenceClassExtract:
+        parser = self.get_llm("parser", "llm")
+        prompt = clean_indents(f"""
+Return JSON only:
+{{"reference_totals": [], "trend_multiplier": null, "notes": null}}
+
+Question:
+{question.question_text}
+
+Research:
+{research}
+
+Extract comparable reference totals (last period, same period last year, etc.) and an optional trend_multiplier.
+""")
+        raw = await parser.invoke(prompt)
+        return safe_model(ReferenceClassExtract, sanitize_llm_json(raw))  # type: ignore[return-value]
+
+    async def _llm_extract_level_series(self, question: NumericQuestion, research: str) -> LevelSeriesExtract:
+        parser = self.get_llm("parser", "llm")
+        prompt = clean_indents(f"""
+Return JSON only:
+{{"current_value": null, "current_date": null, "recent_values": [], "notes": null}}
+
+Question:
+{question.question_text}
+
+Research:
+{research}
+
+Extract the latest observed level and a few recent values if available.
+""")
+        raw = await parser.invoke(prompt)
+        return safe_model(LevelSeriesExtract, sanitize_llm_json(raw))  # type: ignore[return-value]
+
+    def _delta_bounds_for_horizon(self, horizon_days: Optional[int]) -> Tuple[float, float]:
+        h = horizon_days if horizon_days is not None else 30
+        if h <= 21:
+            return (-0.60, 0.60)
+        if h <= 60:
+            return (-1.00, 1.00)
+        return (-2.00, 2.00)
+
+    def _mult_bounds_for_horizon(self, horizon_days: Optional[int]) -> Tuple[float, float]:
+        h = horizon_days if horizon_days is not None else 30
+        if h <= 21:
+            return (0.97, 1.03)
+        if h <= 60:
+            return (0.95, 1.05)
+        return (0.90, 1.10)
+
+    async def _forecast_numeric_partial_reveal(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
+        known_rx = self._regex_extract_known_subtotal(research)
+        extracted: Optional[PartialRevealExtract] = None
+        try:
+            extracted = await self._llm_extract_partial_reveal(question, research)
+        except Exception as e:
+            logger.warning(f"Partial-reveal extraction failed: {e}")
+
+        known_subtotal = (
+            float(extracted.known_subtotal) if (extracted and extracted.known_subtotal)
+            else (float(known_rx) if known_rx else None)
+        )
+        known_parts = int(extracted.known_parts) if (extracted and extracted.known_parts is not None) else None
+        total_parts = int(extracted.total_parts) if (extracted and extracted.total_parts is not None) else None
+
+        if known_subtotal is None:
+            return await self._run_forecast_on_numeric_generic(question, research)
+
+        if known_parts and total_parts and total_parts > known_parts and known_parts > 0:
+            per_part = known_subtotal / known_parts
+            remainder_baseline = per_part * (total_parts - known_parts)
+        else:
+            remainder_baseline = 0.85 * known_subtotal
+
+        lo_m, hi_m = self._mult_bounds_for_horizon(self._horizon_days_from_text(question))
+        mult = await self._bounded_multiplier(question, research, remainder_baseline, lo=lo_m, hi=hi_m)
+        remainder_mean = remainder_baseline * mult
+        total_mean = known_subtotal + remainder_mean
+
+        remainder_sd = max(0.08 * remainder_mean, 0.02 * total_mean)
+        pcts = self._normal_percentiles_from_mean_sd(total_mean, remainder_sd)
+        for p in pcts:
+            if p.value < known_subtotal:
+                p.value = known_subtotal
+        pcts = self._enforce_monotone(pcts)
+
+        dist = NumericDistribution.from_question(pcts, question)
+        med = self._median_from_40_60(pcts)
+
+        reasoning = (
+            f"{self._methodology_header(research)} "
+            f"Regime=partial_reveal_sum: locked known subtotal≈{known_subtotal:.6g}; "
+            f"modeled remainder baseline≈{remainder_baseline:.6g} × bounded multiplier {mult:.4f}; "
+            f"uncertainty on remainder only; enforced total≥known. {self._numeric_summary_line(pcts)}."
+        )
+        self._recent_predictions.append((question, float(med / (abs(med) + 1.0)) if med else 0.0))
+        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
+
+    async def _forecast_numeric_level_series_endvalue(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
+        ex: Optional[LevelSeriesExtract] = None
+        try:
+            ex = await self._llm_extract_level_series(question, research)
+        except Exception as e:
+            logger.warning(f"Level-series extraction failed: {e}")
+
+        level = float(ex.current_value) if (ex and ex.current_value is not None) else None
+        if level is None or not np.isfinite(level) or level <= 0:
+            return await self._forecast_numeric_structured_ts(question, research, force_non_level=True)
+
+        horizon = self._horizon_days_from_text(question)
+        lo_d, hi_d = self._delta_bounds_for_horizon(horizon)
+        delta = await self._bounded_delta(question, research, level, lo=lo_d, hi=hi_d)
+        mean = level + delta
+
+        sd = None
+        if ex and ex.recent_values and len(ex.recent_values) >= 5:
+            vals = [float(v) for v in ex.recent_values if isinstance(v, (int, float)) and np.isfinite(v)]
+            if len(vals) >= 5:
+                changes = np.diff(vals)
+                daily_sd = float(np.std(changes)) if len(changes) > 1 else 0.0
+                h = float(horizon if horizon is not None else 10)
+                sd = float(np.sqrt(max(2.0, h)) * max(daily_sd, 0.02))
+        if sd is None:
+            h = float(horizon if horizon is not None else 10)
+            sd = float(np.clip(0.12 * np.sqrt(max(2.0, h)), 0.08, 0.90))
+
+        pcts = self._normal_percentiles_from_mean_sd(mean, sd)
+
+        lo = float(question.lower_bound)
+        hi = float(question.upper_bound)
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            for p in pcts:
+                p.value = float(np.clip(p.value, lo, hi))
+            pcts = self._enforce_monotone(pcts)
+
+        dist = NumericDistribution.from_question(pcts, question)
+        med = self._median_from_40_60(pcts)
+
+        reasoning = (
+            f"{self._methodology_header(research)} "
+            f"Regime=level_series_endvalue: baseline(latest)≈{level:.6g}; "
+            f"bounded delta={delta:.4g} within [{lo_d:.3g},{hi_d:.3g}] horizon≈{horizon or 'n/a'}d; "
+            f"sd from recent volatility if available else conservative default. {self._numeric_summary_line(pcts)}."
+        )
+        self._recent_predictions.append((question, float(med / (abs(med) + 1.0)) if med else 0.0))
+        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
+
+    async def _forecast_numeric_structured_ts(self, question: NumericQuestion, research: str, *, force_non_level: bool = False) -> ReasonedPrediction[NumericDistribution]:
+        if (not force_non_level) and self._is_level_series_question(question):
+            return await self._forecast_numeric_level_series_endvalue(question, research)
+
+        lo = float(question.lower_bound)
+        hi = float(question.upper_bound)
+        baseline = 0.5 * (lo + hi) if np.isfinite(lo) and np.isfinite(hi) and hi > lo else 1.0
+
+        try:
+            ref = await self._llm_extract_reference_class(question, research)
+            refs = [float(x) for x in (ref.reference_totals or []) if isinstance(x, (int, float)) and x > 0 and np.isfinite(x)]
+            if refs:
+                baseline = float(np.median(refs))
+                if ref.trend_multiplier and np.isfinite(float(ref.trend_multiplier)):
+                    tm = float(ref.trend_multiplier)
+                    if 0.8 <= tm <= 1.2:
+                        baseline *= tm
+        except Exception as e:
+            logger.warning(f"Structured TS extraction failed: {e}")
+
+        horizon = self._horizon_days_from_text(question)
+        lo_m, hi_m = self._mult_bounds_for_horizon(horizon)
+        mult = await self._bounded_multiplier(question, research, baseline, lo=lo_m, hi=hi_m)
+        mean = baseline * mult
+
+        width = (hi - lo) if np.isfinite(hi - lo) and (hi - lo) > 0 else None
+        sd = max(0.06 * abs(mean), 0.02 * width) if width is not None else 0.06 * abs(mean)
+        sd = float(np.clip(sd, 1e-9, max(1e-9, 0.25 * abs(mean) + 1e-9)))
+
+        pcts = self._normal_percentiles_from_mean_sd(mean, sd)
+
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            for p in pcts:
+                p.value = float(np.clip(p.value, lo, hi))
+            pcts = self._enforce_monotone(pcts)
+
+        dist = NumericDistribution.from_question(pcts, question)
+        med = self._median_from_40_60(pcts)
+
+        reasoning = (
+            f"{self._methodology_header(research)} "
+            f"Regime=structured_ts: baseline≈{baseline:.6g}; bounded multiplier x{mult:.4f} within [{lo_m:.3f},{hi_m:.3f}] horizon≈{horizon or 'n/a'}d; "
+            f"short-horizon sd heuristic; monotone enforced. {self._numeric_summary_line(pcts)}."
+        )
+        self._recent_predictions.append((question, float(med / (abs(med) + 1.0)) if med else 0.0))
+        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
 
     async def _get_model_forecast(self, model_name: str, question: MetaculusQuestion, research: str) -> Any:
         self._ensure_some_research_or_raise(research)
-
         temp = self._get_temperature(question)
         llm = GeneralLlm(model=model_name, temperature=temp)
 
@@ -877,8 +1129,7 @@ OUTPUT ONLY VALID JSON:
             )
 
         if isinstance(question, MultipleChoiceQuestion):
-            example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
-            schema_example = json.dumps({"predicted_options": example_opts})
+            schema_example = json.dumps({"predicted_options": [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]})
             raw = await llm.invoke(
                 clean_indents(
                     f"""
@@ -902,16 +1153,14 @@ OUTPUT ONLY VALID JSON:
 
         if isinstance(question, NumericQuestion):
             upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
-            units = question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"
+            units = question.unit_of_measure if question.unit_of_measure else "Not stated"
             reasoning = await llm.invoke(
                 clean_indents(
                     f"""
-You are a professional forecaster.
-
 Question:
 {question.question_text}
 
-Units for answer: {units}
+Units: {units}
 
 Research:
 {research}
@@ -937,56 +1186,14 @@ Percentile 90: XX
 
         raise TypeError(f"Unsupported question type: {type(question)}")
 
-    # ------------------------------------------
-    # Publishing-friendly short reasoning strings
-    # ------------------------------------------
-
-    def _short_reasoning_binary(
-        self,
-        research: str,
-        final_p: float,
-        raw_p: float,
-        red_p: float,
-        extremized_p: float,
-        spread: float,
-        quality: float,
-        applied: List[str],
-    ) -> str:
-        src = self._search_footprint(research)
-        applied_txt = ", ".join(applied) if applied else "none"
-        return (
-            f"[{self.bot_name}] approach: multi-source research({src}); 3-model ensemble→critic→red-team; "
-            f"controls({applied_txt}); final={final_p:.3f} (critic={raw_p:.3f}, red={red_p:.3f}, ext={extremized_p:.3f}, spread={spread:.3f}, q={quality:.2f})"
-        )
-
-    def _short_reasoning_mc(self, research: str, avg_prob: float) -> str:
-        src = self._search_footprint(research)
-        return f"[{self.bot_name}] approach: research({src}); 3-model ensemble→critic; normalized options; avg_prob={avg_prob:.3f}"
-
-    def _short_reasoning_numeric(self, research: str, median_proxy: float) -> str:
-        src = self._search_footprint(research)
-        return f"[{self.bot_name}] approach: research({src}); 3-model ensemble→critic; parsed percentiles; median≈{median_proxy:g}"
-
-    # ------------------------------------------
-    # Forecasting: Binary
-    # ------------------------------------------
-
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
         self._ensure_some_research_or_raise(research)
-
-        forecasters = [
-            "openrouter/openai/gpt-5.1",
-            "openrouter/openai/gpt-5",
-            "openrouter/anthropic/claude-4.5-sonnet",
-        ]
-
+        forecasters = ["openrouter/openai/gpt-5.1", "openrouter/openai/gpt-5", "openrouter/anthropic/claude-4.5-sonnet"]
         results = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
         model_probs = [float(r.prediction_in_decimal) for r in results]
         forecast_map: Dict[str, float] = {f"model_{i}": float(r.prediction_in_decimal) for i, r in enumerate(results)}
-
         spread = (max(model_probs) - min(model_probs)) if len(model_probs) > 1 else 0.0
 
-        # Critic aggregates
         critic_llm = self.get_llm("critic", "llm")
         critique = await critic_llm.invoke(
             clean_indents(
@@ -1012,13 +1219,10 @@ OUTPUT ONLY JSON:
         )
         raw_p = float(critic_out.prediction_in_decimal)
 
-        # Red-team adjusts
         red_teamed_p = await self._red_team_forecast(question, research, raw_p)
         averaged_p = 0.5 * (raw_p + red_teamed_p)
 
         applied: List[str] = []
-
-        # Disagreement shrink
         if spread >= 0.35:
             averaged_p = 0.6 * averaged_p + 0.4 * 0.5
             applied.append("high-spread-shrink")
@@ -1026,30 +1230,25 @@ OUTPUT ONLY JSON:
             averaged_p = 0.8 * averaged_p + 0.2 * 0.5
             applied.append("med-spread-shrink")
 
-        # Consistency check
         if not await self._check_consistency(question, averaged_p):
             averaged_p = 0.5 * averaged_p + 0.5 * 0.5
             applied.append("consistency-shrink")
 
-        # Blend with community if present (research-quality weighted)
         community = getattr(question, "community_prediction", None)
         quality = self._research_quality_weight(research)
         blended_p = (quality * averaged_p + (1 - quality) * float(community)) if (community is not None) else averaged_p
         if community is not None:
             applied.append("community-blend")
 
-        # Extremize (optional)
         ext_strength = self._extremize_strength(research, model_probs + [raw_p, red_teamed_p], question)
         p_ext = ForecastingPrinciples.extremize_logit(blended_p, ext_strength)
         if self.flags.enable_extremize and abs(ext_strength - 1.0) > 0.05:
             applied.append(f"extremize(x{ext_strength:.2f})")
 
-        # Time decay (anti-extremize far from close)
         p_time = ForecastingPrinciples.apply_time_decay(p_ext, getattr(question, "close_time", None))
         if p_time != p_ext:
             applied.append("time-decay")
 
-        # Calibration (from ForecastBot base, if implemented)
         try:
             p_cal = self.apply_bayesian_calibration(p_time * 100) / 100.0
             if p_cal != p_time:
@@ -1070,30 +1269,18 @@ OUTPUT ONLY JSON:
             quality=quality,
             applied=applied,
         )
-
         return ReasonedPrediction(prediction_value=final_p, reasoning=reasoning)
-
-    # ------------------------------------------
-    # Forecasting: Multiple choice
-    # ------------------------------------------
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
         self._ensure_some_research_or_raise(research)
-
-        forecasters = [
-            "openrouter/openai/gpt-5.1",
-            "openrouter/openai/gpt-5",
-            "openrouter/anthropic/claude-4.5-sonnet",
-        ]
+        forecasters = ["openrouter/openai/gpt-5.1", "openrouter/openai/gpt-5", "openrouter/anthropic/claude-4.5-sonnet"]
         results = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
         forecast_map = {f"model_{i}": r.model_dump() for i, r in enumerate(results)}
 
         critic_llm = self.get_llm("critic", "llm")
-        example_opts = [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]
-        schema_example = json.dumps({"predicted_options": example_opts})
-
+        schema_example = json.dumps({"predicted_options": [{"option_name": opt, "probability": 0.5} for opt in question.options[:2]]})
         critique = await critic_llm.invoke(
             clean_indents(
                 f"""
@@ -1106,7 +1293,7 @@ Research:
 Ensemble model forecasts:
 {json.dumps(forecast_map)}
 
-OUTPUT ONLY JSON:
+OUTPUT ONLY VALID JSON:
 {schema_example}
 """
             )
@@ -1118,7 +1305,6 @@ OUTPUT ONLY JSON:
             num_validation_samples=self._structure_output_validation_samples,
         )
 
-        # Align + normalize
         option_names = question.options
         current = {o.option_name: float(o.probability) for o in final_list.predicted_options}
         aligned = [{"option_name": name, "probability": float(current.get(name, 0.0))} for name in option_names]
@@ -1131,49 +1317,32 @@ OUTPUT ONLY JSON:
             for o in aligned:
                 o["probability"] /= total
 
-        final_val = safe_model(PredictedOptionList, {"predicted_options": aligned})
+        final_val = safe_model(PredictedOptionList, {"predicted_options": aligned})  # type: ignore[assignment]
         avg_prob = float(np.mean([o["probability"] for o in aligned])) if aligned else 0.0
         self._recent_predictions.append((question, avg_prob))
 
         reasoning = self._short_reasoning_mc(research, avg_prob)
         return ReasonedPrediction(prediction_value=final_val, reasoning=reasoning)
 
-    # ------------------------------------------
-    # Forecasting: Numeric
-    # ------------------------------------------
-
-    async def _run_forecast_on_numeric(
+    async def _run_forecast_on_numeric_generic(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
         self._ensure_some_research_or_raise(research)
+        forecasters = ["openrouter/openai/gpt-5.1", "openrouter/openai/gpt-5", "openrouter/anthropic/claude-4.5-sonnet"]
+        results: List[List[Percentile]] = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
 
-        forecasters = [
-            "openrouter/openai/gpt-5.1",
-            "openrouter/openai/gpt-5",
-            "openrouter/anthropic/claude-4.5-sonnet",
-        ]
-        results: List[List[Percentile]] = await asyncio.gather(
-            *[self._get_model_forecast(m, question, research) for m in forecasters]
-        )
-
-        forecast_map = {
-            f"model_{i}": [{"percentile": float(p.percentile), "value": float(p.value)} for p in r]
-            for i, r in enumerate(results)
-        }
-
+        forecast_map = {f"model_{i}": [{"percentile": float(p.percentile), "value": float(p.value)} for p in r] for i, r in enumerate(results)}
         upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
-        units = question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"
+        units = question.unit_of_measure if question.unit_of_measure else "Not stated"
         critic_llm = self.get_llm("critic", "llm")
 
         critique = await critic_llm.invoke(
             clean_indents(
                 f"""
-You are a professional forecaster.
-
 Question:
 {question.question_text}
 
-Units for answer: {units}
+Units: {units}
 
 Research:
 {research}
@@ -1203,37 +1372,49 @@ Percentile 90: XX
         final_pcts = self._enforce_monotone(final_pcts)
 
         dist = NumericDistribution.from_question(final_pcts, question)
-        median_proxy = self._median_from_40_60(final_pcts)
+        med = self._median_from_40_60(final_pcts)
 
-        # store a bounded scalar for consistency check purposes
-        self._recent_predictions.append((question, float(median_proxy / (abs(median_proxy) + 1.0)) if median_proxy else 0.0))
-
-        reasoning = self._short_reasoning_numeric(research, median_proxy)
+        self._recent_predictions.append((question, float(med / (abs(med) + 1.0)) if med else 0.0))
+        reasoning = self._short_reasoning_numeric_generic(research, final_pcts)
         return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
 
+    async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
+        self._ensure_some_research_or_raise(research)
+        if not self.flags.enable_numeric_regimes:
+            return await self._run_forecast_on_numeric_generic(question, research)
 
-# =========================================================
-# 🚀 MAIN EXECUTION
-# =========================================================
+        regime = self._detect_numeric_regime(question, research)
+
+        if regime == NumericRegime.PARTIAL_REVEAL_SUM:
+            try:
+                return await self._forecast_numeric_partial_reveal(question, research)
+            except Exception as e:
+                logger.warning(f"Partial-reveal regime failed, fallback to generic: {e}")
+                return await self._run_forecast_on_numeric_generic(question, research)
+
+        if regime == NumericRegime.STRUCTURED_TS:
+            try:
+                return await self._forecast_numeric_structured_ts(question, research)
+            except Exception as e:
+                logger.warning(f"Structured TS regime failed, fallback to generic: {e}")
+                return await self._run_forecast_on_numeric_generic(question, research)
+
+        return await self._run_forecast_on_numeric_generic(question, research)
+
+    async def _run_forecast_on_numeric_wrapper(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
+        return await self._run_forecast_on_numeric(question, research)
+
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
     parser = argparse.ArgumentParser(description="Run the Advanced Forecasting Bot (botduke)")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["tournament", "metaculus_cup", "test_questions"],
-        default="tournament",
-        help="Specify the run mode (default: tournament)",
-    )
-    parser.add_argument("--bot-name", type=str, default="botduke", help="Bot display name for reasoning strings")
-    parser.add_argument("--no-extremize", action="store_true", help="Disable extremization")
-    parser.add_argument("--no-decomposition", action="store_true", help="Disable question decomposition")
-    parser.add_argument("--meta-forecast", action="store_true", help="Enable meta-forecast hook (stub)")
+    parser.add_argument("--mode", type=str, choices=["tournament", "metaculus_cup", "test_questions"], default="tournament")
+    parser.add_argument("--bot-name", type=str, default="botduke")
+    parser.add_argument("--no-extremize", action="store_true")
+    parser.add_argument("--no-decomposition", action="store_true")
+    parser.add_argument("--meta-forecast", action="store_true")
+    parser.add_argument("--no-numeric-regimes", action="store_true")
 
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
@@ -1242,6 +1423,7 @@ if __name__ == "__main__":
         enable_extremize=not args.no_extremize,
         enable_decomposition=not args.no_decomposition,
         enable_meta_forecast=args.meta_forecast,
+        enable_numeric_regimes=not args.no_numeric_regimes,
     )
 
     bot = SpringAdvancedForecastingBot(
@@ -1259,33 +1441,23 @@ if __name__ == "__main__":
 
     async def run_all():
         if run_mode == "tournament":
-            seasonal_task = bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
-            )
-            minibench_task = bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
+            seasonal_task = bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True)
+            minibench_task = bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True)
             seasonal, minibench = await asyncio.gather(seasonal_task, minibench_task)
             return seasonal + minibench
 
         if run_mode == "metaculus_cup":
             bot.skip_previously_forecasted_questions = False
-            return await bot.forecast_on_tournament(
-                client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
-            )
+            return await bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
 
-        # test_questions
         bot.skip_previously_forecasted_questions = False
-
         EXAMPLE_QUESTION_URLS = [
             "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
             "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
         ]
         questions = [client.get_question_by_url(url.strip()) for url in EXAMPLE_QUESTION_URLS]
-
         single_reports_task = bot.forecast_questions(questions, return_exceptions=True)
         market_pulse_task = bot.forecast_on_tournament("market-pulse-26q1", return_exceptions=True)
-
         single_reports, market_pulse_reports = await asyncio.gather(single_reports_task, market_pulse_task)
         return single_reports + market_pulse_reports
 
