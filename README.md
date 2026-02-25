@@ -1,5 +1,5 @@
 # my Spring Advanced Forecasting Bot
-
+from metac template code
 A general-purpose forecasting bot that pulls evidence from multiple news/search providers (Tavily, Exa, AskNews), ensembles multiple LLM forecasters, applies critique + red-teaming, and optionally publishes forecasts/reports to Metaculus tournaments.
 
 It’s built on top of `forecasting_tools` (e.g., `ForecastBot`, `MetaculusClient`, question/prediction schemas) and adds:
