@@ -502,10 +502,10 @@ class SpringAdvancedForecastingBot(ForecastBot):
         decomposer      | openrouter/openai/gpt-5-mini       | Simple decomposition
         """
         return {
-            "default":         "openrouter/openai/gpt-5.2",
+            "default":         "openrouter/openai/gpt-5.4",
             "parser":          "openrouter/openai/gpt-5-mini",
             "summarizer":      "openrouter/openai/gpt-5-mini",
-            "researcher":      "openrouter/openai/gpt-5.2",
+            "researcher":      "openrouter/openai/gpt-5.4",
             "query_optimizer": "openrouter/openai/gpt-5-mini",
             "critic":          "openrouter/anthropic/claude-opus-4.6",
             "red_team":        "openrouter/anthropic/claude-sonnet-4.6",
