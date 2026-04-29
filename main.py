@@ -15,7 +15,7 @@ import dotenv
 import httpx
 from pydantic import BaseModel, Field
 
-from tavily import TavilyClient
+from tavily import AsyncTavilyClient
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -40,6 +40,15 @@ logger = logging.getLogger(__name__)
 
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
+
+MINIBENCH_TOURNAMENT_ID = 33022
+MINIBENCH_TOURNAMENT_SLUG = "minibench"
+
+_TAVILY_CLIENT: Optional[AsyncTavilyClient] = None
+_ASKNEWS_SEMAPHORE = asyncio.Semaphore(5)
+_PERPLEXITY_SEMAPHORE = asyncio.Semaphore(5)
+_GPT5_SEARCH_SEMAPHORE = asyncio.Semaphore(5)
+_TAVILY_SEMAPHORE = asyncio.Semaphore(5)
 
 # â”€â”€â”€ Conservative tuning constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _MAX_EXTREMIZE_STRENGTH    = 1.3   # was 2.0 â€” prevents overconfidence
@@ -86,6 +95,158 @@ def safe_model(model_cls: type[BaseModel], data: Any) -> BaseModel:
     except Exception as e:
         logger.error(f"MODEL INSTANTIATION FAILED for {model_cls.__name__}: {e}")
         raise
+
+
+def extremize(p: float, strength: float = 0.3) -> float:
+    p = float(np.clip(p, 1e-6, 1 - 1e-6))
+    odds = p / (1 - p)
+    extremized_odds = odds ** (1 + strength)
+    extremized_p = extremized_odds / (1 + extremized_odds)
+    return float(np.clip(extremized_p, 0.01, 0.99))
+
+
+def extremize_minibench(p: float) -> float:
+    if 0.45 < p < 0.55:
+        return extremize(p, strength=1.2)
+    return extremize(p, strength=0.4)
+
+
+def _stringify_tournament_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(int(value)) if float(value).is_integer() else str(value)
+    for attr in ("slug", "id", "project", "tournament", "name"):
+        nested = getattr(value, attr, None)
+        if nested is not None:
+            text = _stringify_tournament_value(nested)
+            if text:
+                return text
+    if isinstance(value, dict):
+        for key in ("slug", "id", "project", "tournament", "name"):
+            if key in value:
+                text = _stringify_tournament_value(value[key])
+                if text:
+                    return text
+    return None
+
+
+def get_question_tournament_slug(question: Any) -> Optional[str]:
+    candidates = [
+        getattr(question, "tournaments", None),
+        getattr(question, "tournament", None),
+        getattr(question, "project", None),
+        getattr(question, "tournament_slug", None),
+        getattr(question, "project_slug", None),
+        getattr(question, "tournament_id", None),
+        getattr(question, "project_id", None),
+    ]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if isinstance(candidate, (list, tuple, set)):
+            for item in candidate:
+                text = _stringify_tournament_value(item)
+                if text:
+                    return text
+        else:
+            text = _stringify_tournament_value(candidate)
+            if text:
+                return text
+    return None
+
+
+def is_minibench_question(question: Any) -> bool:
+    slug = get_question_tournament_slug(question)
+    if slug and MINIBENCH_TOURNAMENT_SLUG in slug.lower():
+        return True
+
+    for attr in ("tournaments", "tournament", "project", "tournament_slug", "project_slug", "tournament_id", "project_id"):
+        candidate = getattr(question, attr, None)
+        if candidate is None:
+            continue
+        values = candidate if isinstance(candidate, (list, tuple, set)) else [candidate]
+        for value in values:
+            if isinstance(value, (int, float)) and int(value) == MINIBENCH_TOURNAMENT_ID:
+                return True
+            if isinstance(value, str) and value.strip() == str(MINIBENCH_TOURNAMENT_ID):
+                return True
+            text = _stringify_tournament_value(value)
+            if text and (MINIBENCH_TOURNAMENT_SLUG in text.lower() or text == str(MINIBENCH_TOURNAMENT_ID)):
+                return True
+    return False
+
+
+def _get_tavily_client() -> Optional[AsyncTavilyClient]:
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return None
+
+    global _TAVILY_CLIENT
+    if _TAVILY_CLIENT is None:
+        _TAVILY_CLIENT = AsyncTavilyClient(api_key=api_key)
+    return _TAVILY_CLIENT
+
+
+async def research_tavily(question: str) -> str:
+    client = _get_tavily_client()
+    if client is None:
+        logger.warning("Tavily search skipped: TAVILY_API_KEY is not configured")
+        return ""
+
+    async with _TAVILY_SEMAPHORE:
+        try:
+            result = await client.search_context(question, search_depth="advanced", max_tokens=4000)
+            if not result:
+                logger.warning("Tavily search returned empty result")
+                return ""
+            if isinstance(result, str):
+                return result.strip()
+            return str(result).strip()
+        except Exception as e:
+            logger.warning(f"Tavily search failed: {e}")
+            return ""
+
+
+async def _research_openrouter_search(question: str, model_name: str, provider_name: str, semaphore: asyncio.Semaphore) -> str:
+    async with semaphore:
+        try:
+            llm = GeneralLlm(model=model_name, temperature=0)
+            prompt = clean_indents(f"""
+You are a search assistant for a superforecaster.
+Use live web search if available through your provider.
+Return concise factual evidence with sources when possible.
+Do not provide a forecast.
+
+Question:
+{question}
+
+Output a short research brief.
+""")
+            response = await llm.invoke(prompt)
+            result = (response or "").strip()
+            if not result:
+                logger.warning(f"{provider_name} search returned empty result")
+                return ""
+            return f"=== {provider_name} Search ===\n[{provider_name} Data]\n{result}"
+        except Exception as e:
+            logger.warning(f"{provider_name} search failed: {e}")
+            return ""
+
+
+async def research_perplexity(question: str) -> str:
+    for model_name in ("openrouter/perplexity/sonar-pro", "openrouter/perplexity/sonar"):
+        result = await _research_openrouter_search(question, model_name, "Perplexity", _PERPLEXITY_SEMAPHORE)
+        if result:
+            return result
+    return ""
+
+
+async def research_gpt5_search(question: str) -> str:
+    return await _research_openrouter_search(question, "openrouter/openai/gpt-5.5", "GPT-5", _GPT5_SEARCH_SEMAPHORE)
 
 
 # â”€â”€â”€ Pydantic models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -316,7 +477,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         super().__init__(*args, **kwargs)
         self.bot_name = bot_name
         self.flags = flags or BotFeatureFlags()
-        self.tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY")) if os.getenv("TAVILY_API_KEY") else None
+        self.tavily_api_key     = os.getenv("TAVILY_API_KEY")
         self.exa_searcher = ExaSearcher() if os.getenv("EXA_API_KEY") else None
         self.asknews_client_id     = os.getenv("ASKNEWS_CLIENT_ID")
         self.asknews_client_secret = os.getenv("ASKNEWS_CLIENT_SECRET")
@@ -360,6 +521,8 @@ class SpringAdvancedForecastingBot(ForecastBot):
         if ok("[Tavily Data]",        ["[Tavily not configured]", "[Tavily search failed]"]):    used.append("tavily")
         if ok("[Exa Search Results]", ["[Exa not configured]",    "[Exa search failed]"]):       used.append("exa")
         if ok("[AskNews Data]",       ["[AskNews not configured]","[AskNews search failed]"]):   used.append("asknews")
+        if ok("[Perplexity Data]",    ["[Perplexity search failed]"]):                            used.append("perplexity")
+        if ok("[GPT-5 Data]",         ["[GPT-5 search failed]"]):                                 used.append("gpt5_search")
         if ok("[LLM Web Research]",   ["[LLM web research failed]"]):                            used.append("llm_web")
         if ok("[Meta-Forecast]",      ["[Meta-forecast unavailable]"]):                          used.append("meta")
         return ",".join(used) if used else "none"
@@ -516,21 +679,15 @@ Output ONLY a JSON list: ["query1","query2","query3"]
     # â”€â”€ Individual search providers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _run_tavily_search(self, query: str) -> str:
-        if not self.tavily:
-            return "[Tavily not configured]"
-        try:
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.tavily.search(query=query, search_depth="advanced", max_results=6),
-            )
-            context = "\n".join(
-                [f"Source: {r.get('url','')}\nContent: {r.get('content','')}" for r in response.get("results", [])]
-            )
-            return f"[Tavily Data]\n{context}" if context.strip() else "[Tavily search failed]"
-        except Exception as e:
-            logger.error(f"Tavily search failed: {e}")
-            return "[Tavily search failed]"
+        if not self.tavily_api_key:
+            logger.warning("Tavily search skipped: TAVILY_API_KEY is not configured")
+            return ""
+
+        result = await research_tavily(query)
+        if not result:
+            logger.warning("Tavily search returned no usable output")
+            return ""
+        return f"=== Tavily Search ===\n[Tavily Data]\n{result}"
 
     async def _run_exa_search(self, query: str) -> str:
         if not self.exa_searcher:
@@ -538,18 +695,23 @@ Output ONLY a JSON list: ["query1","query2","query3"]
         return await self.exa_searcher.search(query, num_results=6)
 
     async def _run_asknews_search(self, query: str) -> str:
-        if not self.asknews_client_id or not self.asknews_client_secret:
-            return "[AskNews not configured]"
-        try:
-            searcher = AskNewsSearcher(
-                client_id=self.asknews_client_id,
-                client_secret=self.asknews_client_secret,
-            )
-            result = await searcher.call_preconfigured_version("asknews/news-summaries", query)
-            return f"[AskNews Data]\n{result}" if str(result).strip() else "[AskNews search failed]"
-        except Exception as e:
-            logger.error(f"AskNews search failed: {e}")
-            return "[AskNews search failed]"
+        async with _ASKNEWS_SEMAPHORE:
+            if not self.asknews_client_id or not self.asknews_client_secret:
+                logger.warning("AskNews search skipped: ASKNEWS_CLIENT_ID / ASKNEWS_CLIENT_SECRET is not configured")
+                return ""
+            try:
+                searcher = AskNewsSearcher(
+                    client_id=self.asknews_client_id,
+                    client_secret=self.asknews_client_secret,
+                )
+                result = await searcher.call_preconfigured_version("asknews/news-summaries", query)
+                if not str(result).strip():
+                    logger.warning("AskNews search returned empty result")
+                    return ""
+                return f"=== AskNews Search ===\n[AskNews Data]\n{result}"
+            except Exception as e:
+                logger.warning(f"AskNews search failed: {e}")
+                return ""
 
     async def _run_llm_web_research(
         self, question: MetaculusQuestion, decomp: Optional[DecompositionOutput]
@@ -618,6 +780,8 @@ Fine print:
             self._run_tavily_search(optimized_query),
             self._run_exa_search(optimized_query),
             self._run_asknews_search(optimized_query),
+            research_perplexity(optimized_query),
+            research_gpt5_search(optimized_query),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1370,11 +1534,11 @@ Percentile 90: XX
     ) -> ReasonedPrediction[float]:
         self._ensure_some_research_or_raise(research)
 
-        # Diverse ensemble: GPT-5.2, Claude Opus 4.6, Claude Sonnet 4.6
+        # Diverse ensemble: GPT-5.5, Claude Opus 4.7, Claude Sonnet 4.7
         forecasters = [
-            "openrouter/openai/gpt-5.2",
-            "openrouter/anthropic/claude-opus-4.6",
-            "openrouter/anthropic/claude-sonnet-4.6",
+            "openrouter/openai/gpt-5.5",
+            "openrouter/anthropic/claude-opus-4.7",
+            "openrouter/anthropic/claude-sonnet-4.7",
         ]
         results     = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
         model_probs = [float(r.prediction_in_decimal) for r in results]
@@ -1431,10 +1595,17 @@ OUTPUT ONLY JSON:
         if community is not None:
             applied.append(f"community-blend(c={float(community):.3f})")
 
-        ext_strength = self._extremize_strength(research, model_probs + [raw_p, red_teamed_p], question)
-        p_ext        = ForecastingPrinciples.extremize_logit(blended_p, ext_strength)
-        if self.flags.enable_extremize and abs(ext_strength - 1.0) > 0.05:
-            applied.append(f"extremize(Ã—{ext_strength:.2f})")
+        tournament_slug = get_question_tournament_slug(question) or "unknown"
+        if self.flags.enable_extremize:
+            p_before_ext = blended_p
+            if is_minibench_question(question):
+                p_ext = extremize_minibench(p_before_ext)
+            else:
+                p_ext = extremize(p_before_ext, strength=0.3)
+            logger.info(f"Extremized: {p_before_ext:.3f} → {p_ext:.3f} (tournament={tournament_slug})")
+            applied.append("extremize(minibench)" if is_minibench_question(question) else "extremize(0.3)")
+        else:
+            p_ext = blended_p
 
         p_time = ForecastingPrinciples.apply_time_decay(p_ext, getattr(question, "close_time", None))
         if p_time != p_ext:
@@ -1472,9 +1643,9 @@ OUTPUT ONLY JSON:
         self._ensure_some_research_or_raise(research)
 
         forecasters = [
-            "openrouter/openai/gpt-5.2",
-            "openrouter/anthropic/claude-opus-4.6",
-            "openrouter/anthropic/claude-sonnet-4.6",
+            "openrouter/openai/gpt-5.5",
+            "openrouter/anthropic/claude-opus-4.7",
+            "openrouter/anthropic/claude-sonnet-4.7",
         ]
         results      = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
         model_probs  = [float(np.mean([o.probability for o in r.predicted_options])) for r in results]
@@ -1504,6 +1675,15 @@ OUTPUT ONLY VALID JSON:
         option_names = question.options
         current      = {o.option_name: float(o.probability) for o in final_list.predicted_options}
         aligned      = [{"option_name": name, "probability": float(current.get(name, 0.0))} for name in option_names]
+        tournament_slug = get_question_tournament_slug(question) or "unknown"
+        if self.flags.enable_extremize:
+            use_minibench = is_minibench_question(question)
+            for o in aligned:
+                p_before_ext = float(o["probability"])
+                p_after_ext = extremize_minibench(p_before_ext) if use_minibench else extremize(p_before_ext, strength=0.3)
+                logger.info(f"Extremized: {p_before_ext:.3f} → {p_after_ext:.3f} (tournament={tournament_slug})")
+                o["probability"] = p_after_ext
+
         total        = float(sum(o["probability"] for o in aligned))
         if total <= 0:
             uniform = 1.0 / len(aligned)
@@ -1535,9 +1715,9 @@ OUTPUT ONLY VALID JSON:
         self._ensure_some_research_or_raise(research)
 
         forecasters = [
-            "openrouter/openai/gpt-5.2",
-            "openrouter/anthropic/claude-opus-4.6",
-            "openrouter/anthropic/claude-sonnet-4.6",
+            "openrouter/openai/gpt-5.5",
+            "openrouter/anthropic/claude-opus-4.7",
+            "openrouter/anthropic/claude-sonnet-4.7",
         ]
         results: List[List[Percentile]] = await asyncio.gather(
             *[self._get_model_forecast(m, question, research) for m in forecasters]
