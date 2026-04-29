@@ -1869,11 +1869,12 @@ if __name__ == "__main__":
             "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
         ]
         questions = [client.get_question_by_url(url.strip()) for url in EXAMPLE_QUESTION_URLS]
-        single_reports, market_pulse_reports = await asyncio.gather(
+        single_reports, market_pulse_q2_reports, summer_eval_reports = await asyncio.gather(
             bot.forecast_questions(questions, return_exceptions=True),
-            bot.forecast_on_tournament("market-pulse-26q1", return_exceptions=True),
+            bot.forecast_on_tournament("market-pulse-26q2", return_exceptions=True),
+            bot.forecast_on_tournament("summer-futureeval-2026", return_exceptions=True),
         )
-        return single_reports + market_pulse_reports
+        return single_reports + market_pulse_q2_reports + summer_eval_reports
 
     reports = asyncio.run(run_all())
     bot.log_report_summary(reports)
