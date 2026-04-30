@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 
+CURRENT_AI_COMPETITION_ID = 33022
 MINIBENCH_TOURNAMENT_ID = 33022
 MINIBENCH_TOURNAMENT_SLUG = "minibench"
 
@@ -108,8 +109,8 @@ def extremize(p: float, strength: float = 0.3) -> float:
 
 def extremize_minibench(p: float) -> float:
     if 0.45 < p < 0.55:
-        return extremize(p, strength=1.2)
-    return extremize(p, strength=0.4)
+        return extremize(p, strength=1.8)
+    return extremize(p, strength=0.85)
 
 
 def _stringify_tournament_value(value: Any) -> Optional[str]:
@@ -503,17 +504,17 @@ class SpringAdvancedForecastingBot(ForecastBot):
         researcher      | openrouter/openai/gpt-5.2          | Long-context + web search
         query_optimizer | openrouter/openai/gpt-5-mini       | Simple rewrite task
         critic          | openrouter/anthropic/claude-opus-4.6 | Best adversarial reasoning
-        red_team        | openrouter/anthropic/claude-sonnet-4.6 | Strong, diverse from critic
+        red_team        | openrouter/anthropic/claude-sonnet-4.7 | Strong, diverse from critic
         decomposer      | openrouter/openai/gpt-5-mini       | Simple decomposition
         """
         return {
-            "default":         "openrouter/openai/gpt-5.4",
+            "default":         "openrouter/openai/gpt-5.5",
             "parser":          "openrouter/openai/gpt-5-mini",
             "summarizer":      "openrouter/openai/gpt-5-mini",
-            "researcher":      "openrouter/openai/gpt-5.4",
+            "researcher":      "openrouter/openai/gpt-5.5",
             "query_optimizer": "openrouter/openai/gpt-5-mini",
             "critic":          "openrouter/anthropic/claude-opus-4.6",
-            "red_team":        "openrouter/anthropic/claude-sonnet-4.6",
+            "red_team":        "openrouter/anthropic/claude-sonnet-4.7",
             "decomposer":      "openrouter/openai/gpt-5-mini",
         }
 
@@ -778,10 +779,17 @@ Fine print:
     # â”€â”€ Research orchestration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        decomp  = await self._decompose_question(question)
-        queries = await self._optimize_search_query(question, decomp)
+        # Parallel decomposition and search query optimization
+        decomp, queries = await asyncio.gather(
+            self._decompose_question(question),
+            self._optimize_search_query(question, None),
+        )
+        if decomp:
+            # Re-optimize queries with decomposition info
+            queries = await self._optimize_search_query(question, decomp)
         optimized_query = " OR ".join(queries)
 
+        # Parallel research fan-out: Tavily, Exa, AskNews, Perplexity, GPT-5 search
         tasks   = [
             self._run_tavily_search(optimized_query),
             self._run_exa_search(optimized_query),
@@ -1541,10 +1549,10 @@ Percentile 90: XX
     ) -> ReasonedPrediction[float]:
         self._ensure_some_research_or_raise(research)
 
-        # Diverse ensemble: GPT-5.5, Claude Opus 4.7, Claude Sonnet 4.7
+        # Diverse ensemble: GPT-5.5, Claude Opus 4.6, Claude Sonnet 4.7
         forecasters = [
             "openrouter/openai/gpt-5.5",
-            "openrouter/anthropic/claude-opus-4.7",
+            "openrouter/anthropic/claude-opus-4.6",
             "openrouter/anthropic/claude-sonnet-4.7",
         ]
         results     = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
@@ -1651,7 +1659,7 @@ OUTPUT ONLY JSON:
 
         forecasters = [
             "openrouter/openai/gpt-5.5",
-            "openrouter/anthropic/claude-opus-4.7",
+            "openrouter/anthropic/claude-opus-4.6",
             "openrouter/anthropic/claude-sonnet-4.7",
         ]
         results      = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
@@ -1723,7 +1731,7 @@ OUTPUT ONLY VALID JSON:
 
         forecasters = [
             "openrouter/openai/gpt-5.5",
-            "openrouter/anthropic/claude-opus-4.7",
+            "openrouter/anthropic/claude-opus-4.6",
             "openrouter/anthropic/claude-sonnet-4.7",
         ]
         results: List[List[Percentile]] = await asyncio.gather(
@@ -1860,11 +1868,12 @@ if __name__ == "__main__":
 
     async def run_all():
         if run_mode == "tournament":
-            seasonal, minibench = await asyncio.gather(
-                bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True),
+            seasonal, minibench, market_pulse = await asyncio.gather(
+                bot.forecast_on_tournament(CURRENT_AI_COMPETITION_ID, return_exceptions=True),
                 bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True),
+                bot.forecast_on_tournament("market-pulse-26q2", return_exceptions=True),
             )
-            return seasonal + minibench
+            return seasonal + minibench + market_pulse
 
         if run_mode == "metaculus_cup":
             bot.skip_previously_forecasted_questions = False

@@ -10,7 +10,7 @@ It’s built on top of `forecasting_tools` (e.g., `ForecastBot`, `MetaculusClien
 - **Safety + robustness**:
   - JSON sanitization for messy LLM outputs (e.g., `1_000`, `"percentile": "10%"`)
   - Pydantic-safe coercion into typed schemas
-  - disagreement-based shrinkage toward 50%
+⁹  - disagreement-based shrinkage toward 50%
   - time-decay smoothing toward 50% for far-future close dates
   - calibration to reduce overconfidence in extremes
 - **Brief “comment-style” reasoning**: outputs concise debug-style metadata (median/spread/search footprint)
