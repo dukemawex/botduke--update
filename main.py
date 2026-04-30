@@ -329,33 +329,29 @@ class DetailedReasoning(BaseModel):
     final_derivation: str = ""
 
     def render(self) -> str:
-        """Render to a readable multi-paragraph string."""
+        """Render to a brief, succinct summary."""
         lines: List[str] = []
-        lines.append(f"QUESTION RESTATEMENT\n{self.question_restatement}")
-        lines.append(f"\nBASE RATE & REFERENCE CLASS\n{self.base_rate_analysis}")
+        lines.append(f"Forecast: {self.final_derivation}")
+        
         if self.evidence_summary:
-            lines.append("\nEVIDENCE SUMMARY")
-            for fact in self.evidence_summary:
-                lines.append(f"  â€¢ {fact}")
-        if self.supporting_factors:
-            lines.append("\nFACTORS SUPPORTING RESOLUTION YES / HIGHER")
-            for f in self.supporting_factors:
-                lines.append(f"  + {f}")
-        if self.contrary_factors:
-            lines.append("\nFACTORS AGAINST / LOWER")
-            for f in self.contrary_factors:
-                lines.append(f"  - {f}")
+            evidence = "; ".join(self.evidence_summary[:3])
+            lines.append(f"\nEvidence: {evidence}")
+        
+        if self.supporting_factors or self.contrary_factors:
+            supports = " | ".join(self.supporting_factors[:2]) if self.supporting_factors else ""
+            contrasts = " | ".join(self.contrary_factors[:2]) if self.contrary_factors else ""
+            factors = f"{supports} vs {contrasts}" if (supports and contrasts) else (supports or contrasts)
+            if factors:
+                lines.append(f"\nFactors: {factors}")
+        
         if self.key_uncertainties:
-            lines.append("\nKEY UNCERTAINTIES")
-            for u in self.key_uncertainties:
-                lines.append(f"  ? {u}")
-        if self.model_ensemble_summary:
-            lines.append(f"\nMODEL ENSEMBLE\n{self.model_ensemble_summary}")
+            uncertainties = ", ".join(self.key_uncertainties[:2])
+            lines.append(f"\nUncertainties: {uncertainties}")
+        
         if self.calibration_steps:
-            lines.append("\nCALIBRATION STEPS")
-            for step in self.calibration_steps:
-                lines.append(f"  â†’ {step}")
-        lines.append(f"\nFINAL DERIVATION\n{self.final_derivation}")
+            steps = "; ".join(self.calibration_steps[:3])
+            lines.append(f"\nSteps: {steps}")
+        
         return "\n".join(lines)
 
 
@@ -601,8 +597,6 @@ class SpringAdvancedForecastingBot(ForecastBot):
             )
 
         critic = self.get_llm("critic", "llm")
-        ensemble_desc = ", ".join(f"{p:.3f}" for p in model_probs)
-
         prompt = clean_indents(f"""
 You are writing a detailed forecasting report for a superforecaster platform.
 Produce a JSON object with EXACTLY these keys:
@@ -614,15 +608,16 @@ Produce a JSON object with EXACTLY these keys:
   "supporting_factors": ["factor 1", ...],   // 3-5 factors pushing toward YES / higher
   "contrary_factors":   ["factor 1", ...],   // 3-5 factors pushing toward NO / lower
   "key_uncertainties":  ["uncertainty 1", ...],  // 2-4 things that could most move this
-  "model_ensemble_summary": "Brief description of model outputs: {ensemble_desc} â†’ final {final_p:.3f}",
-  "calibration_steps": ["step 1", ...],   // enumerate each adjustment: base rate, research quality, spread, time decay, etc.
-  "final_derivation": "2-3 sentence narrative explaining the final number."
+  "model_ensemble_summary": "",
+  "calibration_steps": ["step 1", ...],   // enumerate each adjustment applied
+  "final_derivation": "2-3 sentence narrative explaining the final forecast and key reasoning."
 }}
 
 Rules:
 - Be specific: cite numbers, dates, and named sources where available.
 - Be conservative: acknowledge uncertainty explicitly.
 - Do NOT invent facts not present in the research.
+- Do NOT mention models, searchers, or methodology used.
 - Output ONLY the JSON object, no preamble.
 
 Question: {question.question_text}
