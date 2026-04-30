@@ -212,7 +212,7 @@ async def research_tavily(question: str) -> str:
 
     async with _TAVILY_SEMAPHORE:
         try:
-            result = await client.search_context(question, search_depth="advanced", max_tokens=4000)
+            result = await client.search(question, search_depth="advanced", max_tokens=4000)
             if not result:
                 logger.warning("Tavily search returned empty result")
                 return ""
