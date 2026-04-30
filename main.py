@@ -35,6 +35,17 @@ from forecasting_tools import (
     structure_output,
 )
 
+from advanced_features import (
+    FactVerifier,
+    TimeSeriesMomentum,
+    MarketDataIntegrator,
+    RegulatoryTracker,
+    ScenarioAnalyzer,
+    UncertaintyQuantifier,
+    QuestionClassifier,
+    QuestionCategory,
+)
+
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -489,6 +500,15 @@ class SpringAdvancedForecastingBot(ForecastBot):
         self.asknews_client_secret = os.getenv("ASKNEWS_CLIENT_SECRET")
         # Capped list: (question, final_p)
         self._recent_predictions: list[tuple[MetaculusQuestion, float]] = []
+        
+        # Advanced forecasting features
+        self.fact_verifier = FactVerifier()
+        self.momentum_analyzer = TimeSeriesMomentum()
+        self.market_integrator = MarketDataIntegrator()
+        self.regulatory_tracker = RegulatoryTracker()
+        self.scenario_analyzer = ScenarioAnalyzer()
+        self.uncertainty_quantifier = UncertaintyQuantifier()
+        self.question_classifier = QuestionClassifier()
 
     # â”€â”€ Model configuration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -779,6 +799,10 @@ Fine print:
     # â”€â”€ Research orchestration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def run_research(self, question: MetaculusQuestion) -> str:
+        # Classify question by domain
+        category, confidence = self.question_classifier.classify(question.question_text)
+        logger.info(f"Question classification: {category.value} (confidence={confidence:.2f})")
+        
         # Parallel decomposition and search query optimization
         decomp, queries = await asyncio.gather(
             self._decompose_question(question),
@@ -821,6 +845,36 @@ Fine print:
             f"{ForecastingPrinciples.get_conservative_reasoning_prompt()}\n\n"
             f"{combined}"
         )
+
+        # Integrate advanced features into research pipeline
+        try:
+            # Fact verification
+            fact_verifications = await self.fact_verifier.verify_claims(research)
+            if fact_verifications:
+                verified_claims = "\n\n[FACT VERIFICATION]"
+                for fv in fact_verifications[:5]:
+                    verified_claims += f"\n- {fv.claim[:100]}: confidence={fv.confidence:.2f}, contradictions={fv.contradiction_count}"
+                research += verified_claims
+            
+            # Regulatory event tracking
+            regulatory_events = await self.regulatory_tracker.identify_regulatory_events(question.question_text, research)
+            if regulatory_events:
+                reg_block = "\n\n[REGULATORY EVENTS]"
+                for event in regulatory_events:
+                    reg_block += f"\n- {event.title} ({event.event_type}): impact={event.impact_estimate:.2f}"
+                research += reg_block
+            
+            # Market signals for relevant keywords
+            keywords = re.findall(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', question.question_text)[:5]
+            if keywords:
+                market_signals = await self.market_integrator.fetch_market_signals(keywords)
+                if market_signals:
+                    market_block = "\n\n[MARKET SIGNALS]"
+                    for signal in market_signals:
+                        market_block += f"\n- {signal.ticker}: ${signal.price:.2f} ({signal.change_pct:+.2f}%)"
+                    research += market_block
+        except Exception as e:
+            logger.debug(f"Advanced feature integration failed: {e}")
 
         self._ensure_some_research_or_raise(research)
         thin = not self._ensure_research_has_facts(research)
@@ -1383,6 +1437,18 @@ Extract the latest observed level and a few recent values if available.
         if ex and ex.recent_values and len(ex.recent_values) >= 5:
             vals = [float(v) for v in ex.recent_values if isinstance(v, (int, float)) and np.isfinite(v)]
             if len(vals) >= 5:
+                # Integrated momentum analysis
+                try:
+                    momentum = await self.momentum_analyzer.analyze_momentum(vals)
+                    logger.info(f"Momentum analysis: trend={momentum.trend}, strength={momentum.momentum_strength:.2f}, projected={momentum.projected_value:.4f}")
+                    
+                    # Adjust mean based on momentum
+                    if momentum.momentum_strength > 0.5:
+                        momentum_adjustment = momentum.projected_value * 0.1
+                        mean = mean * 0.9 + (level + momentum_adjustment) * 0.1
+                except Exception as e:
+                    logger.debug(f"Momentum analysis failed: {e}")
+                
                 changes  = np.diff(vals)
                 daily_sd = float(np.std(changes)) if len(changes) > 1 else 0.0
                 h        = float(horizon if horizon is not None else 10)
@@ -1648,6 +1714,31 @@ OUTPUT ONLY JSON:
             + f"\n\n[calibration log] critic={raw_p:.3f} red={red_teamed_p:.3f} "
             f"ext={p_ext:.3f} time-decay={p_time:.3f} final={final_p:.3f}"
         )
+        
+        # Integrate scenario analysis and uncertainty quantification
+        try:
+            # Scenario analysis (bull/base/bear)
+            scenarios = await self.scenario_analyzer.generate_scenarios(question, research, self.get_llm("default", "llm"))
+            scenario_blended_p = sum(s.probability * s.predicted_value for s in scenarios)
+            final_p_with_scenarios = 0.7 * final_p + 0.3 * scenario_blended_p
+            
+            # Uncertainty quantification
+            model_predictions = [final_p, scenario_blended_p] + [p for p in model_probs if 0 < p < 1]
+            research_quality = self._research_quality_weight(research)
+            uncertainty = self.uncertainty_quantifier.quantify_uncertainty(
+                model_predictions, research_quality=research_quality
+            )
+            
+            reasoning += f"\n\n[SCENARIO ANALYSIS] bull={scenarios[0].probability:.2f}@{scenarios[0].predicted_value:.3f} | "
+            reasoning += f"base={scenarios[1].probability:.2f}@{scenarios[1].predicted_value:.3f} | "
+            reasoning += f"bear={scenarios[2].probability:.2f}@{scenarios[2].predicted_value:.3f}"
+            reasoning += f"\n[UNCERTAINTY] credible_interval=[{uncertainty.credible_interval[0]:.3f}, {uncertainty.credible_interval[1]:.3f}] | "
+            reasoning += f"epistemic={uncertainty.epistemic_unc:.3f} aleatoric={uncertainty.aleatoric_unc:.3f}"
+            
+            final_p = float(np.clip(final_p_with_scenarios, 0.03, 0.97))
+        except Exception as e:
+            logger.debug(f"Scenario & uncertainty integration failed: {e}")
+        
         return ReasonedPrediction(prediction_value=final_p, reasoning=reasoning)
 
     # â”€â”€ Multiple-choice forecasting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
