@@ -48,6 +48,7 @@ _TAVILY_CLIENT: Optional[AsyncTavilyClient] = None
 _ASKNEWS_SEMAPHORE = asyncio.Semaphore(5)
 _PERPLEXITY_SEMAPHORE = asyncio.Semaphore(5)
 _GPT5_SEARCH_SEMAPHORE = asyncio.Semaphore(5)
+_GPT5_BASE_SEMAPHORE = asyncio.Semaphore(5)
 _TAVILY_SEMAPHORE = asyncio.Semaphore(5)
 
 # â”€â”€â”€ Conservative tuning constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -247,6 +248,10 @@ async def research_perplexity(question: str) -> str:
 
 async def research_gpt5_search(question: str) -> str:
     return await _research_openrouter_search(question, "openrouter/openai/gpt-5.5", "GPT-5", _GPT5_SEARCH_SEMAPHORE)
+
+
+async def research_gpt5_base(question: str) -> str:
+    return await _research_openrouter_search(question, "openrouter/openai/gpt-5", "GPT-5-Base", _GPT5_BASE_SEMAPHORE)
 
 
 # â”€â”€â”€ Pydantic models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -523,6 +528,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         if ok("[AskNews Data]",       ["[AskNews not configured]","[AskNews search failed]"]):   used.append("asknews")
         if ok("[Perplexity Data]",    ["[Perplexity search failed]"]):                            used.append("perplexity")
         if ok("[GPT-5 Data]",         ["[GPT-5 search failed]"]):                                 used.append("gpt5_search")
+        if ok("[GPT-5-Base Data]",    ["[GPT-5-Base search failed]"]):                            used.append("gpt5_base")
         if ok("[LLM Web Research]",   ["[LLM web research failed]"]):                            used.append("llm_web")
         if ok("[Meta-Forecast]",      ["[Meta-forecast unavailable]"]):                          used.append("meta")
         return ",".join(used) if used else "none"
@@ -536,7 +542,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         if srcs == "none":
             return 0.25
         n = len(srcs.split(","))
-        return {1: 0.50, 2: 0.65, 3: 0.78, 4: 0.85, 5: 0.90}.get(n, 0.55)
+        return {1: 0.50, 2: 0.65, 3: 0.78, 4: 0.85, 5: 0.90, 6: 0.93}.get(n, 0.55)
         # Note: weights are slightly lower than v1 â†’ more conservative blending
 
     def _ensure_research_has_facts(self, research: str, min_signals: int = 3) -> bool:
@@ -782,6 +788,7 @@ Fine print:
             self._run_asknews_search(optimized_query),
             research_perplexity(optimized_query),
             research_gpt5_search(optimized_query),
+            research_gpt5_base(optimized_query),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
