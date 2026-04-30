@@ -22,30 +22,80 @@ It’s built on top of `forecasting_tools` (e.g., `ForecastBot`, `MetaculusClien
 ### Research pipeline
 For each question the bot:
 
-1. Generates up to **3 optimized search queries** via an LLM.
-2. Runs the searches concurrently:
+1. **Question Classification**: Domain detection (geopolitics, economics, science, tech, business, health, sports)
+2. Generates up to **3 optimized search queries** via an LLM (parallel decomposition + optimization)
+3. Runs searches concurrently:
    - Tavily (advanced depth)
    - Exa (neural news search)
    - AskNews (news summaries)
-3. Prepends baseline forecasting guidance:
+   - Perplexity Sonar (long-context reasoning)
+   - GPT-5 search via OpenRouter
+4. **Fact Verification**: Extracts claims and validates against sources; flags contradictions
+5. **Regulatory Event Tracking**: Identifies SEC filings, policy changes, legal actions
+6. **Market Data Integration**: Real-time crypto/stock prices for relevant keywords
+7. Prepends baseline forecasting guidance:
    - Base rate reminder
    - Fermi decomposition guidance
 
 ### Forecasting pipeline (Binary / Multiple Choice / Numeric)
 Depending on question type:
 
-- **Binary**: returns a probability in decimal (0–1)
-- **Multiple choice**: returns normalized probabilities across the provided options
-- **Numeric**: returns a percentile-based distribution converted into `NumericDistribution`
+- **Binary**: 
+  - Returns probability 0–1 with advanced augmentation
+  - **NEW**: Scenario analysis (bull/base/bear blended 30%)
+  - **NEW**: Uncertainty quantification (Monte Carlo, 90% credible intervals)
+  - Critic + red-team models for robustness
+  - Shrinkage + time-decay + calibration
 
-Binary questions include additional steps:
-- critic model produces a refined forecast from the ensemble
-- red team model challenges the critic’s probability and proposes a revision
-- shrinkage toward 0.5 when models disagree a lot
-- optional internal claim verification (lightweight; does not inflate final reasoning output)
-- consistency check vs recent predictions
-- optional blend with Metaculus community prediction (weighted by research footprint)
-- time decay + calibration + “near-impossible” cap
+- **Multiple Choice**: 
+  - Returns normalized probabilities across options
+  - Ensemble from 3 models (GPT-5.5, Claude Opus 4.6 + 4.7)
+
+- **Numeric**:
+  - Returns percentile-based distribution
+  - **NEW**: Time-series momentum detection (acceleration/deceleration)
+  - Regime detection + bounded delta estimation
+
+### Advanced Features Overview
+
+| Feature | What It Does | Where It's Used |
+|---------|-------------|-----------------|
+| **Fact Verification** | Extracts & validates claims against sources; flags contradictions | Research block enrichment |
+| **Time-Series Momentum** | Detects trend acceleration/deceleration; projects future values | Numeric level-series forecasts |
+| **Market Data** | Real-time crypto/stock prices from CoinGecko & Yahoo Finance | Research context for market-sensitive Qs |
+| **Regulatory Tracker** | Identifies SEC filings, policy changes, legal actions | Research block enrichment |
+| **Scenario Analysis** | Bull/base/bear scenarios with LLM generation | Binary forecasts (30% weight blend) |
+| **Uncertainty Quant** | Monte Carlo posteriors, 90% credible intervals | Binary forecast reasoning & confidence |
+| **Question Classifier** | Domain detection (geo, econ, science, tech, business, health, sports) | Research strategy routing |
+
+---
+
+## Tournament Configuration
+
+The bot is configured to forecast on:
+
+- **Current AI Competition** (ID: **33022**) — Primary tournament
+- **MiniBench** (ID: **33022**, slug: `minibench`) — Aggressive extremization (strength=1.8 for 0.45-0.55 zone)
+- **Market Pulse 26Q2** (slug: `market-pulse-26q2`) — Additional predictions
+
+All three tournaments run in parallel during forecasting batch mode.
+
+---
+
+## Model Configuration
+
+**LLM Ensemble** (as of April 2026):
+
+| Role | Model | Purpose |
+|------|-------|---------|
+| default | openrouter/openai/gpt-5.5 | General reasoning |
+| parser | openrouter/openai/gpt-5-mini | Structured output |
+| summarizer | openrouter/openai/gpt-5-mini | Fast summarization |
+| researcher | openrouter/openai/gpt-5.5 | Long-context web search |
+| query_optimizer | openrouter/openai/gpt-5-mini | Query optimization |
+| critic | openrouter/anthropic/claude-opus-4.6 | Adversarial reasoning |
+| red_team | openrouter/anthropic/claude-sonnet-4.7 | Challenge forecasts |
+| decomposer | openrouter/openai/gpt-5-mini | Question decomposition |
 
 ---
 
