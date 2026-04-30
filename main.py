@@ -219,7 +219,7 @@ async def research_tavily(question: str) -> str:
             if isinstance(result, str):
                 return result.strip()
             return str(result).strip()
-        except Exception as e:
+        except BaseException as e:
             logger.warning(f"Tavily search failed: {e}")
             return ""
 
