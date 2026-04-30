@@ -524,7 +524,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         researcher      | openrouter/openai/gpt-5.2          | Long-context + web search
         query_optimizer | openrouter/openai/gpt-5-mini       | Simple rewrite task
         critic          | openrouter/anthropic/claude-opus-4.6 | Best adversarial reasoning
-        red_team        | openrouter/anthropic/claude-sonnet-4.7 | Strong, diverse from critic
+        red_team        | openrouter/anthropic/claude-sonnet-4.6 | Strong, diverse from critic
         decomposer      | openrouter/openai/gpt-5-mini       | Simple decomposition
         """
         return {
@@ -534,7 +534,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
             "researcher":      "openrouter/openai/gpt-5.5",
             "query_optimizer": "openrouter/openai/gpt-5-mini",
             "critic":          "openrouter/anthropic/claude-opus-4.6",
-            "red_team":        "openrouter/anthropic/claude-sonnet-4.7",
+            "red_team":        "openrouter/anthropic/claude-sonnet-4.6",
             "decomposer":      "openrouter/openai/gpt-5-mini",
         }
 
@@ -1619,7 +1619,7 @@ Percentile 90: XX
         forecasters = [
             "openrouter/openai/gpt-5.5",
             "openrouter/anthropic/claude-opus-4.6",
-            "openrouter/anthropic/claude-sonnet-4.7",
+            "openrouter/anthropic/claude-sonnet-4.6",
         ]
         results     = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
         model_probs = [float(r.prediction_in_decimal) for r in results]
@@ -1751,7 +1751,7 @@ OUTPUT ONLY JSON:
         forecasters = [
             "openrouter/openai/gpt-5.5",
             "openrouter/anthropic/claude-opus-4.6",
-            "openrouter/anthropic/claude-sonnet-4.7",
+            "openrouter/anthropic/claude-sonnet-4.6",
         ]
         results      = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
         model_probs  = [float(np.mean([o.probability for o in r.predicted_options])) for r in results]
@@ -1823,7 +1823,7 @@ OUTPUT ONLY VALID JSON:
         forecasters = [
             "openrouter/openai/gpt-5.5",
             "openrouter/anthropic/claude-opus-4.6",
-            "openrouter/anthropic/claude-sonnet-4.7",
+            "openrouter/anthropic/claude-sonnet-4.6",
         ]
         results: List[List[Percentile]] = await asyncio.gather(
             *[self._get_model_forecast(m, question, research) for m in forecasters]

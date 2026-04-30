@@ -94,7 +94,7 @@ All three tournaments run in parallel during forecasting batch mode.
 | researcher | openrouter/openai/gpt-5.5 | Long-context web search |
 | query_optimizer | openrouter/openai/gpt-5-mini | Query optimization |
 | critic | openrouter/anthropic/claude-opus-4.6 | Adversarial reasoning |
-| red_team | openrouter/anthropic/claude-sonnet-4.7 | Challenge forecasts |
+| red_team | openrouter/anthropic/claude-sonnet-4.6 | Challenge forecasts |
 | decomposer | openrouter/openai/gpt-5-mini | Question decomposition |
 
 ---
