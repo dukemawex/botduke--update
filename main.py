@@ -704,7 +704,7 @@ Output ONLY a JSON list: ["query1","query2","query3"]
                     client_id=self.asknews_client_id,
                     client_secret=self.asknews_client_secret,
                 )
-                result = await searcher.call_preconfigured_version("asknews/news-summaries", query)
+                result = await searcher.get_formatted_news_async(query)
                 if not str(result).strip():
                     logger.warning("AskNews search returned empty result")
                     return ""
