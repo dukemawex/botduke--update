@@ -19,6 +19,13 @@ class ResearchSynthesis:
 
 
 class ForecastingEnhancer:
+    # Minibench calibration thresholds from task specification.
+    MINIBENCH_SIGNAL_THRESHOLD = 0.80
+    MINIBENCH_HIGH_MEDIAN_THRESHOLD = 0.70
+    MINIBENCH_LOW_MEDIAN_THRESHOLD = 0.15
+    MINIBENCH_HIGH_EXTREMIZED_VALUE = 0.90
+    MINIBENCH_LOW_EXTREMIZED_VALUE = 0.03
+
     _DOMAIN_FRAMEWORKS = {
         "ai_safety": (
             "AI SAFETY MENTAL MODEL:\n"
@@ -156,9 +163,9 @@ Rules:
     def apply_minibench_extremization(self, median_forecast: float, signal_strength: float) -> float:
         m = self._clip01(float(median_forecast))
         s = self._clip01(float(signal_strength))
-        if s > 0.8:
-            if m >= 0.70:
-                return 0.90
-            if m <= 0.15:
-                return 0.03
+        if s > self.MINIBENCH_SIGNAL_THRESHOLD:
+            if m >= self.MINIBENCH_HIGH_MEDIAN_THRESHOLD:
+                return self.MINIBENCH_HIGH_EXTREMIZED_VALUE
+            if m <= self.MINIBENCH_LOW_MEDIAN_THRESHOLD:
+                return self.MINIBENCH_LOW_EXTREMIZED_VALUE
         return m

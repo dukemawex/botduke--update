@@ -64,6 +64,11 @@ _PERPLEXITY_SEMAPHORE = asyncio.Semaphore(5)
 _GPT5_SEARCH_SEMAPHORE = asyncio.Semaphore(5)
 _GPT5_BASE_SEMAPHORE = asyncio.Semaphore(5)
 _TAVILY_SEMAPHORE = asyncio.Semaphore(5)
+_ASKNEWS_OS_MODEL_CANDIDATES = (
+    # Providers may expose this model with either namespaced or short identifier.
+    "openrouter/asknews/asknews-os",
+    "asknews/asknews-os",
+)
 
 # â”€â”€â”€ Conservative tuning constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _MAX_EXTREMIZE_STRENGTH    = 1.3   # was 2.0 â€” prevents overconfidence
@@ -269,7 +274,7 @@ async def research_gpt5_base(question: str) -> str:
 
 
 async def research_asknews_os(question: str) -> str:
-    for model_name in ("openrouter/asknews/asknews-os", "asknews/asknews-os"):
+    for model_name in _ASKNEWS_OS_MODEL_CANDIDATES:
         result = await _research_openrouter_search(question, model_name, "AskNews OS", _ASKNEWS_OS_SEMAPHORE)
         if result:
             return result
@@ -1715,9 +1720,11 @@ OUTPUT ONLY JSON:
 
         # Conservative spread-shrink (lower thresholds)
         if spread >= _HIGH_SPREAD_SHRINK_THRESH:
+            # Stronger pull-to-base than v1; tuned to dampen outlier divergence when ensemble spread is large.
             aggregated_p = 0.55 * aggregated_p + 0.45 * 0.5   # stronger pull than v1
             applied.append(f"high-spread-shrink(spread={spread:.2f})")
         elif spread >= _MED_SPREAD_SHRINK_THRESH:
+            # Moderate pull-to-base for mid-level disagreement.
             aggregated_p = 0.75 * aggregated_p + 0.25 * 0.5
             applied.append(f"med-spread-shrink(spread={spread:.2f})")
 
