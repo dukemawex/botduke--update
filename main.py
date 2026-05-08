@@ -45,6 +45,7 @@ from advanced_features import (
     QuestionClassifier,
     QuestionCategory,
 )
+from enhancer import ForecastingEnhancer
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ MINIBENCH_TOURNAMENT_SLUG = "minibench"
 
 _TAVILY_CLIENT: Optional[AsyncTavilyClient] = None
 _ASKNEWS_SEMAPHORE = asyncio.Semaphore(5)
+_ASKNEWS_OS_SEMAPHORE = asyncio.Semaphore(5)
 _PERPLEXITY_SEMAPHORE = asyncio.Semaphore(5)
 _GPT5_SEARCH_SEMAPHORE = asyncio.Semaphore(5)
 _GPT5_BASE_SEMAPHORE = asyncio.Semaphore(5)
@@ -264,6 +266,14 @@ async def research_gpt5_search(question: str) -> str:
 
 async def research_gpt5_base(question: str) -> str:
     return await _research_openrouter_search(question, "openrouter/openai/gpt-5", "GPT-5-Base", _GPT5_BASE_SEMAPHORE)
+
+
+async def research_asknews_os(question: str) -> str:
+    for model_name in ("openrouter/asknews/asknews-os", "asknews/asknews-os"):
+        result = await _research_openrouter_search(question, model_name, "AskNews OS", _ASKNEWS_OS_SEMAPHORE)
+        if result:
+            return result
+    return ""
 
 
 # â”€â”€â”€ Pydantic models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -505,6 +515,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         self.scenario_analyzer = ScenarioAnalyzer()
         self.uncertainty_quantifier = UncertaintyQuantifier()
         self.question_classifier = QuestionClassifier()
+        self.enhancer = ForecastingEnhancer()
 
     # â”€â”€ Model configuration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -543,6 +554,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         if ok("[Tavily Data]",        ["[Tavily not configured]", "[Tavily search failed]"]):    used.append("tavily")
         if ok("[Exa Search Results]", ["[Exa not configured]",    "[Exa search failed]"]):       used.append("exa")
         if ok("[AskNews Data]",       ["[AskNews not configured]","[AskNews search failed]"]):   used.append("asknews")
+        if ok("[AskNews OS Data]",    ["[AskNews OS search failed]"]):                            used.append("asknews_os")
         if ok("[Perplexity Data]",    ["[Perplexity search failed]"]):                            used.append("perplexity")
         if ok("[GPT-5 Data]",         ["[GPT-5 search failed]"]):                                 used.append("gpt5_search")
         if ok("[GPT-5-Base Data]",    ["[GPT-5-Base search failed]"]):                            used.append("gpt5_base")
@@ -575,6 +587,29 @@ class SpringAdvancedForecastingBot(ForecastBot):
             logger.warning(f"Thin research: only {total} factual signals detected.")
             return False
         return True
+
+    @staticmethod
+    def _extract_signal_strength(research: str) -> float:
+        m = re.search(r"Signal Strength:\s*([0-9]*\.?[0-9]+)", research or "", flags=re.IGNORECASE)
+        if not m:
+            return 0.5
+        try:
+            return float(np.clip(float(m.group(1)), 0.0, 1.0))
+        except Exception:
+            return 0.5
+
+    async def _collect_model_forecasts(
+        self, model_names: List[str], question: MetaculusQuestion, research: str
+    ) -> List[Any]:
+        tasks = [self._get_model_forecast(m, question, research) for m in model_names]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        results: List[Any] = []
+        for model_name, item in zip(model_names, gathered):
+            if isinstance(item, Exception):
+                logger.warning(f"Model forecast failed ({model_name}): {item}")
+                continue
+            results.append(item)
+        return results
 
     # â”€â”€ Reasoning builder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -735,6 +770,17 @@ Output ONLY a JSON list: ["query1","query2","query3"]
                 logger.warning(f"AskNews search failed: {e}")
                 return ""
 
+    async def _run_asknews_os_search(self, query: str) -> str:
+        try:
+            result = await research_asknews_os(query)
+            if not result:
+                logger.warning("AskNews OS search returned no usable output")
+                return ""
+            return result
+        except Exception as e:
+            logger.warning(f"AskNews OS search failed: {e}")
+            return ""
+
     async def _run_llm_web_research(
         self, question: MetaculusQuestion, decomp: Optional[DecompositionOutput]
     ) -> str:
@@ -797,6 +843,8 @@ Fine print:
         # Classify question by domain
         category, confidence = self.question_classifier.classify(question.question_text)
         logger.info(f"Question classification: {category.value} (confidence={confidence:.2f})")
+        route_name, domain_framework = self.enhancer.route_domain_framework(question.question_text, category.value)
+        logger.info(f"Domain route selected: {route_name}")
         
         # Parallel decomposition and search query optimization
         decomp, queries = await asyncio.gather(
@@ -808,11 +856,12 @@ Fine print:
             queries = await self._optimize_search_query(question, decomp)
         optimized_query = " OR ".join(queries)
 
-        # Parallel research fan-out: Tavily, Exa, AskNews, Perplexity, GPT-5 search
+        # Parallel research fan-out: Tavily, Exa, AskNews, AskNews OS, Perplexity, GPT-5 search
         tasks   = [
             self._run_tavily_search(optimized_query),
             self._run_exa_search(optimized_query),
             self._run_asknews_search(optimized_query),
+            self._run_asknews_os_search(optimized_query),
             research_perplexity(optimized_query),
             research_gpt5_search(optimized_query),
             research_gpt5_base(optimized_query),
@@ -834,10 +883,21 @@ Fine print:
         if meta_block:
             combined = combined + "\n\n" + meta_block
 
+        synthesis = await self.enhancer.synthesize_research(question.question_text, combined)
+        combined = (
+            f"{combined}\n\n"
+            f"[RESEARCH SYNTHESIS: GPT-5.5 ONLINE]\n"
+            f"Domain Route: {route_name}\n"
+            f"Context Summary: {synthesis.context_summary}\n"
+            f"Signal Strength: {float(synthesis.signal_strength):.3f}\n"
+            f"Directional Bias: {float(synthesis.directional_bias):.3f}"
+        )
+
         research = (
             f"{ForecastingPrinciples.get_generic_base_rate()}\n\n"
             f"{ForecastingPrinciples.get_generic_fermi_prompt()}\n\n"
             f"{ForecastingPrinciples.get_conservative_reasoning_prompt()}\n\n"
+            f"{domain_framework}\n\n"
             f"{combined}"
         )
 
@@ -1170,7 +1230,7 @@ Answer YES or NO only.
         src = self._search_footprint(research)
         return (
             f"[{self.bot_name}] sources({src}); "
-            f"conservative ensemble (GPT-5.2 + Claude Opus 4.6 + Claude Sonnet 4.6); "
+            f"conservative ensemble median (GPT-5.5 + GPT-5.1 + Claude Opus 4.6 + Claude Sonnet 4.6); "
             f"extremize cap={_MAX_EXTREMIZE_STRENGTH}; spread-shrink thresholds="
             f"{_HIGH_SPREAD_SHRINK_THRESH}/{_MED_SPREAD_SHRINK_THRESH}."
         )
@@ -1610,15 +1670,20 @@ Percentile 90: XX
     ) -> ReasonedPrediction[float]:
         self._ensure_some_research_or_raise(research)
 
-        # Diverse ensemble: GPT-5.5, Claude Opus 4.6, Claude Sonnet 4.7
+        # Diverse ensemble with median protocol: GPT-5.5, GPT-5.1, Claude Opus 4.6, Claude Sonnet 4.6
         forecasters = [
             "openrouter/openai/gpt-5.5",
+            "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-opus-4.6",
             "openrouter/anthropic/claude-sonnet-4.6",
         ]
-        results     = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
+        results = await self._collect_model_forecasts(forecasters, question, research)
+        if not results:
+            raise RuntimeError("No model forecasts available for binary prediction.")
         model_probs = [float(r.prediction_in_decimal) for r in results]
+        ensemble_median = self.enhancer.median_probability(model_probs)
         forecast_map = {f"model_{i}": p for i, p in enumerate(model_probs)}
+        forecast_map["ensemble_median"] = ensemble_median
         spread       = (max(model_probs) - min(model_probs)) if len(model_probs) > 1 else 0.0
 
         critic_llm = self.get_llm("critic", "llm")
@@ -1643,9 +1708,10 @@ OUTPUT ONLY JSON:
         raw_p = float(critic_out.prediction_in_decimal)
 
         red_teamed_p = await self._red_team_forecast(question, research, raw_p)
-        averaged_p   = 0.5 * (raw_p + red_teamed_p)
+        averaged_p = self.enhancer.median_probability([ensemble_median, raw_p, red_teamed_p])
 
         applied: List[str] = []
+        applied.append("median-protocol(ensemble+critic+redteam)")
 
         # Conservative spread-shrink (lower thresholds)
         if spread >= _HIGH_SPREAD_SHRINK_THRESH:
@@ -1675,11 +1741,16 @@ OUTPUT ONLY JSON:
         if self.flags.enable_extremize:
             p_before_ext = blended_p
             if is_minibench_question(question):
-                p_ext = extremize_minibench(p_before_ext)
+                signal_strength = self._extract_signal_strength(research)
+                p_ext = self.enhancer.apply_minibench_extremization(p_before_ext, signal_strength)
+                if p_ext != p_before_ext:
+                    applied.append(f"minibench-signal-extremize(sig={signal_strength:.2f})")
+                else:
+                    applied.append(f"minibench-raw-median(sig={signal_strength:.2f})")
             else:
                 p_ext = extremize(p_before_ext, strength=0.3)
+                applied.append("extremize(0.3)")
             logger.info(f"Extremized: {p_before_ext:.3f} → {p_ext:.3f} (tournament={tournament_slug})")
-            applied.append("extremize(minibench)" if is_minibench_question(question) else "extremize(0.3)")
         else:
             p_ext = blended_p
 
@@ -1745,10 +1816,13 @@ OUTPUT ONLY JSON:
 
         forecasters = [
             "openrouter/openai/gpt-5.5",
+            "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-opus-4.6",
             "openrouter/anthropic/claude-sonnet-4.6",
         ]
-        results      = await asyncio.gather(*[self._get_model_forecast(m, question, research) for m in forecasters])
+        results = await self._collect_model_forecasts(forecasters, question, research)
+        if not results:
+            raise RuntimeError("No model forecasts available for multiple-choice prediction.")
         model_probs  = [float(np.mean([o.probability for o in r.predicted_options])) for r in results]
         forecast_map = {f"model_{i}": r.model_dump() for i, r in enumerate(results)}
 
@@ -1817,12 +1891,14 @@ OUTPUT ONLY VALID JSON:
 
         forecasters = [
             "openrouter/openai/gpt-5.5",
+            "openrouter/openai/gpt-5.1",
             "openrouter/anthropic/claude-opus-4.6",
             "openrouter/anthropic/claude-sonnet-4.6",
         ]
-        results: List[List[Percentile]] = await asyncio.gather(
-            *[self._get_model_forecast(m, question, research) for m in forecasters]
-        )
+        raw_results = await self._collect_model_forecasts(forecasters, question, research)
+        results: List[List[Percentile]] = [r for r in raw_results if isinstance(r, list)]
+        if not results:
+            raise RuntimeError("No model forecasts available for numeric prediction.")
         forecast_map = {
             f"model_{i}": [{"percentile": float(p.percentile), "value": float(p.value)} for p in r]
             for i, r in enumerate(results)

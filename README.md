@@ -4,9 +4,10 @@ A general-purpose forecasting bot that pulls evidence from multiple news/search 
 
 It’s built on top of `forecasting_tools` (e.g., `ForecastBot`, `MetaculusClient`, question/prediction schemas) and adds:
 
-- **Multi-source research**: Tavily + Exa + AskNews (all optional, enabled via env vars)
+- **Multi-source research**: Tavily + Exa + AskNews + AskNews OS (all optional, enabled via env vars)
 - **Query optimization**: turns a Metaculus question into 3 targeted search queries
 - **LLM ensemble**: multiple models generate forecasts, then a critic model produces the final call
+- **Median protocol**: ensemble aggregation uses median (with GPT-5.1 added) for stronger outlier robustness
 - **Safety + robustness**:
   - JSON sanitization for messy LLM outputs (e.g., `1_000`, `"percentile": "10%"`)
   - Pydantic-safe coercion into typed schemas
@@ -25,15 +26,19 @@ For each question the bot:
 1. **Question Classification**: Domain detection (geopolitics, economics, science, tech, business, health, sports)
 2. Generates up to **3 optimized search queries** via an LLM (parallel decomposition + optimization)
 3. Runs searches concurrently:
-   - Tavily (advanced depth)
-   - Exa (neural news search)
-   - AskNews (news summaries)
-   - Perplexity Sonar (long-context reasoning)
-   - GPT-5 search via OpenRouter
-4. **Fact Verification**: Extracts claims and validates against sources; flags contradictions
-5. **Regulatory Event Tracking**: Identifies SEC filings, policy changes, legal actions
-6. **Market Data Integration**: Real-time crypto/stock prices for relevant keywords
-7. Prepends baseline forecasting guidance:
+    - Tavily (advanced depth)
+    - Exa (neural news search)
+    - AskNews (news summaries)
+    - AskNews OS (parallel news/search stream)
+    - Perplexity Sonar (long-context reasoning)
+    - GPT-5 search via OpenRouter
+4. **Synthesis Node (GPT-5.5 Online)**: merges all parallel source outputs into:
+   - qualitative context summary
+   - `Signal Strength` coefficient (0.0–1.0) based on cross-source consistency
+5. **Fact Verification**: Extracts claims and validates against sources; flags contradictions
+6. **Regulatory Event Tracking**: Identifies SEC filings, policy changes, legal actions
+7. **Market Data Integration**: Real-time crypto/stock prices for relevant keywords
+8. Prepends baseline forecasting guidance + domain-specific analytical frameworks (AI Safety / Geopolitics / Finance):
    - Base rate reminder
    - Fermi decomposition guidance
 
@@ -67,6 +72,8 @@ Depending on question type:
 | **Scenario Analysis** | Bull/base/bear scenarios with LLM generation | Binary forecasts (30% weight blend) |
 | **Uncertainty Quant** | Monte Carlo posteriors, 90% credible intervals | Binary forecast reasoning & confidence |
 | **Question Classifier** | Domain detection (geo, econ, science, tech, business, health, sports) | Research strategy routing |
+| **Domain Router** | Routes to AI Safety / Geopolitics / Finance mental models | Research + forecast framing |
+| **Synthesis + Signal Strength** | GPT-5.5 Online consolidation + consistency coefficient (0.0–1.0) | Post-research calibration |
 
 ---
 
@@ -89,6 +96,7 @@ All three tournaments run in parallel during forecasting batch mode.
 | Role | Model | Purpose |
 |------|-------|---------|
 | default | openrouter/openai/gpt-5.5 | General reasoning |
+| ensemble member | openrouter/openai/gpt-5.1 | Additional diversity + median robustness |
 | parser | openrouter/openai/gpt-5-mini | Structured output |
 | summarizer | openrouter/openai/gpt-5-mini | Fast summarization |
 | researcher | openrouter/openai/gpt-5.5 | Long-context web search |
