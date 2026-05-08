@@ -1708,21 +1708,21 @@ OUTPUT ONLY JSON:
         raw_p = float(critic_out.prediction_in_decimal)
 
         red_teamed_p = await self._red_team_forecast(question, research, raw_p)
-        averaged_p = self.enhancer.median_probability([ensemble_median, raw_p, red_teamed_p])
+        aggregated_p = self.enhancer.median_probability([ensemble_median, raw_p, red_teamed_p])
 
         applied: List[str] = []
         applied.append("median-protocol(ensemble+critic+redteam)")
 
         # Conservative spread-shrink (lower thresholds)
         if spread >= _HIGH_SPREAD_SHRINK_THRESH:
-            averaged_p = 0.55 * averaged_p + 0.45 * 0.5   # stronger pull than v1
+            aggregated_p = 0.55 * aggregated_p + 0.45 * 0.5   # stronger pull than v1
             applied.append(f"high-spread-shrink(spread={spread:.2f})")
         elif spread >= _MED_SPREAD_SHRINK_THRESH:
-            averaged_p = 0.75 * averaged_p + 0.25 * 0.5
+            aggregated_p = 0.75 * aggregated_p + 0.25 * 0.5
             applied.append(f"med-spread-shrink(spread={spread:.2f})")
 
-        if not await self._check_consistency(question, averaged_p):
-            averaged_p = 0.5 * averaged_p + 0.5 * 0.5
+        if not await self._check_consistency(question, aggregated_p):
+            aggregated_p = 0.5 * aggregated_p + 0.5 * 0.5
             applied.append("consistency-shrink")
 
         community = getattr(question, "community_prediction", None)
@@ -1730,10 +1730,10 @@ OUTPUT ONLY JSON:
 
         # Conservative: if research is weak, pull more toward base rate (0.5)
         if quality < 0.6:
-            averaged_p = (1 - _WEAK_RESEARCH_PRIOR_WT) * averaged_p + _WEAK_RESEARCH_PRIOR_WT * 0.5
+            aggregated_p = (1 - _WEAK_RESEARCH_PRIOR_WT) * aggregated_p + _WEAK_RESEARCH_PRIOR_WT * 0.5
             applied.append(f"weak-research-prior(q={quality:.2f})")
 
-        blended_p = (quality * averaged_p + (1 - quality) * float(community)) if (community is not None) else averaged_p
+        blended_p = (quality * aggregated_p + (1 - quality) * float(community)) if (community is not None) else aggregated_p
         if community is not None:
             applied.append(f"community-blend(c={float(community):.3f})")
 

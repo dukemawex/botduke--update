@@ -148,7 +148,10 @@ Rules:
                     values.append(self._clip01(f))
             except Exception:
                 continue
-        return float(median(values)) if values else 0.5
+        if not values:
+            logger.warning("Median protocol received no valid probabilities; defaulting to 0.5")
+            return 0.5
+        return float(median(values))
 
     def apply_minibench_extremization(self, median_forecast: float, signal_strength: float) -> float:
         m = self._clip01(float(median_forecast))
