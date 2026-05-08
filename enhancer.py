@@ -94,6 +94,8 @@ class ForecastingEnhancer:
         pos = sum(text.count(t) for t in positive_terms)
         neg = sum(text.count(t) for t in negative_terms)
 
+        # Laplace smoothing (+1 numerator, +2 denominator) prevents 0/0 and overconfident
+        # extremes when only a few support/conflict cues are detected.
         signal = cls._clip01((support + 1.0) / (support + conflict + 2.0))
         direction = 0.0 if (pos + neg) == 0 else float((pos - neg) / (pos + neg))
         summary = "Heuristic synthesis used due to synthesis-node unavailability."
