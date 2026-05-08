@@ -1686,9 +1686,9 @@ Percentile 90: XX
         if not results:
             raise RuntimeError("No model forecasts available for binary prediction.")
         model_probs = [float(r.prediction_in_decimal) for r in results]
-        ensemble_median = self.enhancer.median_probability(model_probs)
+        model_median = self.enhancer.median_probability(model_probs)
         forecast_map = {f"model_{i}": p for i, p in enumerate(model_probs)}
-        forecast_map["ensemble_median"] = ensemble_median
+        forecast_map["model_median"] = model_median
         spread       = (max(model_probs) - min(model_probs)) if len(model_probs) > 1 else 0.0
 
         critic_llm = self.get_llm("critic", "llm")
@@ -1713,10 +1713,10 @@ OUTPUT ONLY JSON:
         raw_p = float(critic_out.prediction_in_decimal)
 
         red_teamed_p = await self._red_team_forecast(question, research, raw_p)
-        aggregated_p = self.enhancer.median_probability([ensemble_median, raw_p, red_teamed_p])
+        aggregated_p = self.enhancer.median_probability([model_median, raw_p, red_teamed_p])
 
         applied: List[str] = []
-        applied.append("median-protocol(ensemble+critic+redteam)")
+        applied.append("median-protocol(models+critic+redteam)")
 
         # Conservative spread-shrink (lower thresholds)
         if spread >= _HIGH_SPREAD_SHRINK_THRESH:

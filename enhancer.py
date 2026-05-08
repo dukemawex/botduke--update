@@ -19,6 +19,10 @@ class ResearchSynthesis:
 
 
 class ForecastingEnhancer:
+    LAPLACE_NUMERATOR_SMOOTHING = 1.0
+    LAPLACE_DENOMINATOR_SMOOTHING = 2.0
+    MAX_RESEARCH_CONTEXT_LENGTH = 12000
+
     # Minibench calibration thresholds from task specification.
     MINIBENCH_SIGNAL_THRESHOLD = 0.80
     MINIBENCH_HIGH_MEDIAN_THRESHOLD = 0.70
@@ -96,7 +100,10 @@ class ForecastingEnhancer:
 
         # Laplace smoothing (+1 numerator, +2 denominator) prevents 0/0 and overconfident
         # extremes when only a few support/conflict cues are detected.
-        signal = cls._clip01((support + 1.0) / (support + conflict + 2.0))
+        signal = cls._clip01(
+            (support + cls.LAPLACE_NUMERATOR_SMOOTHING)
+            / (support + conflict + cls.LAPLACE_DENOMINATOR_SMOOTHING)
+        )
         direction = 0.0 if (pos + neg) == 0 else float((pos - neg) / (pos + neg))
         summary = "Heuristic synthesis used due to synthesis-node unavailability."
         return ResearchSynthesis(
@@ -114,7 +121,7 @@ Question:
 {question_text}
 
 Aggregated Research:
-{(aggregated_research or "")[:12000]}
+{(aggregated_research or "")[:self.MAX_RESEARCH_CONTEXT_LENGTH]}
 
 Return ONLY JSON:
 {{
