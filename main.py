@@ -1880,19 +1880,22 @@ OUTPUT ONLY JSON:
 
         tournament_slug = get_question_tournament_slug(question) or "unknown"
         is_minibench = is_minibench_question(question)
-        evidence_supports = self._evidence_supports_forecast(research, blended_p, question.question_text)
+        minibench_evidence_supported = False  # Track for clipping decision
         
         if self.flags.enable_extremize:
             p_before_ext = blended_p
-            # For minibench: skip extremization if evidence doesn't support.
+            # For minibench binary: check evidence before extremizing
             if is_minibench:
+                evidence_supports = self._evidence_supports_forecast(research, p_before_ext, question.question_text)
+                minibench_evidence_supported = evidence_supports
                 if evidence_supports:
                     p_ext = extremize_minibench(p_before_ext)
                     applied.append("extremize(minibench)")
+                    logger.info(f"Minibench extremize: evidence_supports=TRUE p_before={p_before_ext:.3f} → {p_ext:.3f}")
                 else:
-                    p_ext = p_before_ext
-                    applied.append("humble-forecast(no-evidence-support)")
-                logger.info(f"Minibench extremize: evidence_supports={evidence_supports} p_before={p_before_ext:.3f} → {p_ext:.3f}")
+                    p_ext = p_before_ext  # No extremization without evidence
+                    applied.append("no-extremize(no-evidence-support)")
+                    logger.info(f"Minibench: evidence_supports=FALSE → no extremization")
             else:
                 p_ext = extremize(p_before_ext, strength=0.3)
                 applied.append("extremize(0.3)")
@@ -1911,10 +1914,11 @@ OUTPUT ONLY JSON:
         except Exception:
             p_cal = p_time
 
-        # Clipping: minibench uses 1%/99%, others use 3%/97%
-        if is_minibench:
-            final_p = float(np.clip(p_cal, 0.01, 0.99))
-            applied.append("clip(1%-99%)")
+        # Clipping: minibench with evidence support forces to 0.01/0.99, otherwise standard
+        if is_minibench and minibench_evidence_supported:
+            # Force to extreme: p < 0.5 → 0.01, p ≥ 0.5 → 0.99
+            final_p = 0.01 if p_cal < 0.5 else 0.99
+            applied.append(f"force-extreme({p_cal:.3f}→{'1%' if final_p == 0.01 else '99%'})")
         else:
             final_p = float(np.clip(p_cal, 0.03, 0.97))
             applied.append("clip(3%-97%)")
@@ -1952,11 +1956,8 @@ OUTPUT ONLY JSON:
             reasoning += f"\n[UNCERTAINTY] credible_interval=[{uncertainty.credible_interval[0]:.3f}, {uncertainty.credible_interval[1]:.3f}] | "
             reasoning += f"epistemic={uncertainty.epistemic_unc:.3f} aleatoric={uncertainty.aleatoric_unc:.3f}"
             
-            # Scenario clipping: use minibench bounds (1%-99%) if applicable
-            if is_minibench:
-                final_p = float(np.clip(final_p_with_scenarios, 0.01, 0.99))
-            else:
-                final_p = float(np.clip(final_p_with_scenarios, 0.03, 0.97))
+            # Scenario clipping: standard bounds (minibench with evidence uses extremes via earlier stage)
+            final_p = float(np.clip(final_p_with_scenarios, 0.03, 0.97))
         except Exception as e:
             logger.debug(f"Scenario & uncertainty integration failed: {e}")
         
@@ -2006,13 +2007,41 @@ OUTPUT ONLY VALID JSON:
         current      = {o.option_name: float(o.probability) for o in final_list.predicted_options}
         aligned      = [{"option_name": name, "probability": float(current.get(name, 0.0))} for name in option_names]
         tournament_slug = get_question_tournament_slug(question) or "unknown"
-        if self.flags.enable_extremize:
-            use_minibench = is_minibench_question(question)
-            for o in aligned:
-                p_before_ext = float(o["probability"])
-                p_after_ext = extremize_minibench(p_before_ext) if use_minibench else extremize(p_before_ext, strength=0.3)
-                logger.info(f"Extremized: {p_before_ext:.3f} → {p_after_ext:.3f} (tournament={tournament_slug})")
-                o["probability"] = p_after_ext
+        
+        # Multiple-choice: extremize only for parent-child (hierarchical) questions with evidence support
+        is_minibench = is_minibench_question(question)
+        is_parent_child = getattr(question, 'parent_question', None) is not None or getattr(question, 'child_questions', None) is not None
+        
+        if self.flags.enable_extremize and (is_parent_child or not is_minibench):
+            # Extremize parent-child questions (with evidence check if minibench) or all non-minibench
+            if is_minibench and is_parent_child:
+                # Check evidence for minibench parent-child
+                avg_before_extremize = float(np.mean([o["probability"] for o in aligned])) if aligned else 0.5
+                evidence_supports = self._evidence_supports_forecast(research, avg_before_extremize, question.question_text)
+                if not evidence_supports:
+                    # Skip extremization for minibench without evidence
+                    pass  # Fall through without extremizing
+                else:
+                    # Extremize minibench parent-child with evidence
+                    for o in aligned:
+                        p_before_ext = float(o["probability"])
+                        p_after_ext = extremize_minibench(p_before_ext)
+                        logger.info(f"Extremized (minibench PC): {p_before_ext:.3f} → {p_after_ext:.3f}")
+                        o["probability"] = p_after_ext
+            elif is_parent_child and not is_minibench:
+                # Non-minibench parent-child: always extremize
+                for o in aligned:
+                    p_before_ext = float(o["probability"])
+                    p_after_ext = extremize(p_before_ext, strength=0.3)
+                    logger.info(f"Extremized (PC): {p_before_ext:.3f} → {p_after_ext:.3f} (tournament={tournament_slug})")
+                    o["probability"] = p_after_ext
+            elif not is_minibench:
+                # Non-minibench non-PC: still extremize (backward compat)
+                for o in aligned:
+                    p_before_ext = float(o["probability"])
+                    p_after_ext = extremize(p_before_ext, strength=0.3)
+                    logger.info(f"Extremized: {p_before_ext:.3f} → {p_after_ext:.3f} (tournament={tournament_slug})")
+                    o["probability"] = p_after_ext
 
         total        = float(sum(o["probability"] for o in aligned))
         if total <= 0:
@@ -2096,6 +2125,7 @@ Percentile 90: XX
         med        = self._median_from_40_60(final_pcts)
         final_pcts = self._enforce_minimum_ci_width(final_pcts, med)
 
+        # Numeric: no extremization, use critic's percentiles directly
         dist = NumericDistribution.from_question(final_pcts, question)
         self._record_prediction(question, float(med / (abs(med) + 1.0)) if med else 0.0)
 
