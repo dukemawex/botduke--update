@@ -69,6 +69,7 @@ _ASKNEWS_OS_MODEL_CANDIDATES = (
     "openrouter/asknews/asknews-os",
     "asknews/asknews-os",
 )
+_OPENROUTER_WEB_SEARCH_SEMAPHORE = asyncio.Semaphore(5)
 
 # â”€â”€â”€ Conservative tuning constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _MAX_EXTREMIZE_STRENGTH    = 1.3   # was 2.0 â€” prevents overconfidence
@@ -279,6 +280,75 @@ async def research_asknews_os(question: str) -> str:
         if result:
             return result
     return ""
+
+async def research_openrouter_web_search(question: str) -> str:
+    """Research using OpenRouter's web_search server tool with model-driven search."""
+    async with _OPENROUTER_WEB_SEARCH_SEMAPHORE:
+        try:
+            api_key = os.getenv("OPENROUTER_API_KEY")
+            if not api_key:
+                logger.warning("OpenRouter web search skipped: OPENROUTER_API_KEY is not configured")
+                return ""
+
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": "https://github.com/Metaculus/metac-bot-template",
+                "X-Title": "BotDuke",
+                "Content-Type": "application/json",
+            }
+
+            # Use GPT-5 with web search tool enabled
+            payload = {
+                "model": "openrouter/openai/gpt-5.5",
+                "temperature": 0,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": clean_indents(f"""
+You are a research assistant for a superforecaster.
+The model will decide when to search, generate queries, and synthesize results.
+Include citations and updated information from web searches.
+Return concise factual evidence with sources when possible.
+Do not provide a forecast.
+
+Question:
+{question}
+
+Output a short research brief with citations.
+"""),
+                    }
+                ],
+                "tools": [{"type": "openrouter:web_search"}],
+            }
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"OpenRouter web search API error: {response.status_code} - {response.text}")
+                    return ""
+                
+                data = response.json()
+                
+                if "choices" not in data or not data["choices"]:
+                    logger.warning("OpenRouter web search returned empty choices")
+                    return ""
+                
+                message = data["choices"][0].get("message", {})
+                content = message.get("content", "").strip()
+                
+                if not content:
+                    logger.warning("OpenRouter web search returned empty content")
+                    return ""
+                
+                return f"=== OpenRouter Web Search ===\n[Web Search with Citations]\n{content}"
+        except Exception as e:
+            logger.warning(f"OpenRouter web search failed: {e}")
+            return ""
 
 
 # â”€â”€â”€ Pydantic models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -603,6 +673,16 @@ class SpringAdvancedForecastingBot(ForecastBot):
         except Exception:
             return 0.5
 
+    @staticmethod
+    def _extract_directional_bias(research: str) -> float:
+        m = re.search(r"Directional Bias:\s*([-+]?[0-9]*\.?[0-9]+)", research or "", flags=re.IGNORECASE)
+        if not m:
+            return 0.0
+        try:
+            return float(np.clip(float(m.group(1)), -1.0, 1.0))
+        except Exception:
+            return 0.0
+
     async def _collect_model_forecasts(
         self, model_names: List[str], question: MetaculusQuestion, research: str
     ) -> List[Any]:
@@ -615,6 +695,41 @@ class SpringAdvancedForecastingBot(ForecastBot):
                 continue
             results.append(item)
         return results
+
+    def _evidence_supports_forecast(self, research: str, forecast_p: float, question_text: str = "") -> bool:
+        """
+        Check if research evidence supports the forecast probability.
+        Returns True if evidence supports the forecast, False if it contradicts or is unclear.
+        For use with minibench: if evidence does not support, give humble forecast without extremization.
+        """
+        try:
+            # Keywords for positive/negative evidence based on forecast direction
+            is_high_forecast = forecast_p > 0.5
+            
+            # Look for strong contradicting signals
+            contradicting_keywords = ["unlikely", "impossible", "no ", "cannot", "failed", "denied", "rejected"]
+            supporting_keywords = ["likely", "confirmed", "achieved", "success", "passed", "approved"]
+            
+            research_lower = research.lower()
+            
+            contradiction_count = sum(1 for kw in contradicting_keywords if kw in research_lower)
+            support_count = sum(1 for kw in supporting_keywords if kw in research_lower)
+            
+            # If we have explicit contradictions and no supporting evidence, evidence doesn't support forecast
+            if contradiction_count > support_count and support_count == 0:
+                return False
+            
+            # Check for minimal factual evidence
+            has_facts = self._ensure_research_has_facts(research, min_signals=2)
+            
+            # If forecast is extreme (>0.9 or <0.1) we require strong evidence
+            if (forecast_p > 0.9 or forecast_p < 0.1) and not has_facts:
+                return False
+            
+            return True
+        except Exception as e:
+            logger.debug(f"Evidence support check failed: {e}")
+            return True  # Default to supporting when check fails
 
     # â”€â”€ Reasoning builder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -861,7 +976,8 @@ Fine print:
             queries = await self._optimize_search_query(question, decomp)
         optimized_query = " OR ".join(queries)
 
-        # Parallel research fan-out: Tavily, Exa, AskNews, AskNews OS, Perplexity, GPT-5 search
+    # Parallel research fan-out: Tavily, Exa, AskNews, AskNews OS, Perplexity,
+    # GPT-5 search, GPT-5 base, and OpenRouter Web Search
         tasks   = [
             self._run_tavily_search(optimized_query),
             self._run_exa_search(optimized_query),
@@ -870,6 +986,7 @@ Fine print:
             research_perplexity(optimized_query),
             research_gpt5_search(optimized_query),
             research_gpt5_base(optimized_query),
+            research_openrouter_web_search(optimized_query),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1713,10 +1830,27 @@ OUTPUT ONLY JSON:
         raw_p = float(critic_out.prediction_in_decimal)
 
         red_teamed_p = await self._red_team_forecast(question, research, raw_p)
-        aggregated_p = self.enhancer.median_probability([model_median, raw_p, red_teamed_p])
+        median_all_p = self.enhancer.median_probability(model_probs + [raw_p, red_teamed_p])
+        avg_critic_red_p = float(np.clip(0.5 * (raw_p + red_teamed_p), 0.0, 1.0))
 
-        applied: List[str] = []
-        applied.append("median-protocol(models+critic+redteam)")
+        # Default to robust center over all opinions.
+        aggregated_p = median_all_p
+        applied: List[str] = ["median-protocol(models+critic+redteam)"]
+
+        # Compare median-all vs critic/red average and keep the option closer to evidence direction.
+        directional_bias = self._extract_directional_bias(research)
+        evidence_target_p = float(np.clip(0.5 + 0.5 * directional_bias, 0.0, 1.0))
+        evidence_supports_agg = self._evidence_supports_forecast(research, median_all_p, question.question_text)
+        if evidence_supports_agg:
+            median_dist = abs(median_all_p - evidence_target_p)
+            avg_dist = abs(avg_critic_red_p - evidence_target_p)
+            if avg_dist + 1e-9 < median_dist:
+                aggregated_p = avg_critic_red_p
+                applied.append("aggregation=avg(critic,red_team)-evidence-aligned")
+            else:
+                applied.append("aggregation=median-all-evidence-aligned")
+        else:
+            applied.append("aggregation=median-all(no-strong-evidence)")
 
         # Conservative spread-shrink (lower thresholds)
         if spread >= _HIGH_SPREAD_SHRINK_THRESH:
@@ -1745,15 +1879,20 @@ OUTPUT ONLY JSON:
             applied.append(f"community-blend(c={float(community):.3f})")
 
         tournament_slug = get_question_tournament_slug(question) or "unknown"
+        is_minibench = is_minibench_question(question)
+        evidence_supports = self._evidence_supports_forecast(research, blended_p, question.question_text)
+        
         if self.flags.enable_extremize:
             p_before_ext = blended_p
-            if is_minibench_question(question):
-                signal_strength = self._extract_signal_strength(research)
-                p_ext = self.enhancer.apply_minibench_extremization(p_before_ext, signal_strength)
-                if p_ext != p_before_ext:
-                    applied.append(f"minibench-signal-extremize(sig={signal_strength:.2f})")
+            # For minibench: skip extremization if evidence doesn't support.
+            if is_minibench:
+                if evidence_supports:
+                    p_ext = extremize_minibench(p_before_ext)
+                    applied.append("extremize(minibench)")
                 else:
-                    applied.append(f"minibench-raw-median(sig={signal_strength:.2f})")
+                    p_ext = p_before_ext
+                    applied.append("humble-forecast(no-evidence-support)")
+                logger.info(f"Minibench extremize: evidence_supports={evidence_supports} p_before={p_before_ext:.3f} → {p_ext:.3f}")
             else:
                 p_ext = extremize(p_before_ext, strength=0.3)
                 applied.append("extremize(0.3)")
@@ -1772,8 +1911,13 @@ OUTPUT ONLY JSON:
         except Exception:
             p_cal = p_time
 
-        # Conservative floor/ceiling: never go below 0.03 or above 0.97
-        final_p = float(np.clip(p_cal, 0.03, 0.97))
+        # Clipping: minibench uses 1%/99%, others use 3%/97%
+        if is_minibench:
+            final_p = float(np.clip(p_cal, 0.01, 0.99))
+            applied.append("clip(1%-99%)")
+        else:
+            final_p = float(np.clip(p_cal, 0.03, 0.97))
+            applied.append("clip(3%-97%)")
         self._record_prediction(question, final_p)
 
         # Build detailed reasoning
@@ -1808,7 +1952,11 @@ OUTPUT ONLY JSON:
             reasoning += f"\n[UNCERTAINTY] credible_interval=[{uncertainty.credible_interval[0]:.3f}, {uncertainty.credible_interval[1]:.3f}] | "
             reasoning += f"epistemic={uncertainty.epistemic_unc:.3f} aleatoric={uncertainty.aleatoric_unc:.3f}"
             
-            final_p = float(np.clip(final_p_with_scenarios, 0.03, 0.97))
+            # Scenario clipping: use minibench bounds (1%-99%) if applicable
+            if is_minibench:
+                final_p = float(np.clip(final_p_with_scenarios, 0.01, 0.99))
+            else:
+                final_p = float(np.clip(final_p_with_scenarios, 0.03, 0.97))
         except Exception as e:
             logger.debug(f"Scenario & uncertainty integration failed: {e}")
         
