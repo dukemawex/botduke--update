@@ -349,7 +349,7 @@ async def research_openrouter_web_search(question: str) -> str:
 
             # Use GPT-5 with web search tool enabled
             payload = {
-                "model": "openrouter/openai/gpt-5.5",
+                "model": "openrouter/openai/gpt-5.4",
                 "temperature": 0,
                 "messages": [
                     {
@@ -663,7 +663,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
             "default":         "openrouter/openai/gpt-5.5",
             "parser":          "openrouter/openai/gpt-5-mini",
             "summarizer":      "openrouter/openai/gpt-5-mini",
-            "researcher":      "openrouter/openai/gpt-5.5",
+            "researcher":      "openrouter/openai/gpt-5.2:online",
             "query_optimizer": "openrouter/openai/gpt-5-mini",
             "critic":          "openrouter/anthropic/claude-opus-4.6",
             "red_team":        "openrouter/anthropic/claude-sonnet-4.6",
