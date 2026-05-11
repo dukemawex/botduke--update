@@ -14,6 +14,7 @@ import numpy as np
 import dotenv
 import httpx
 from pydantic import BaseModel, Field
+from asknews_sdk import AsyncAskNewsSDK
 
 from tavily import AsyncTavilyClient
 
@@ -54,7 +55,6 @@ LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 
 CURRENT_AI_COMPETITION_ID = 33022
-MINIBENCH_TOURNAMENT_ID = 33022
 MINIBENCH_TOURNAMENT_SLUG = "minibench"
 
 _TAVILY_CLIENT: Optional[AsyncTavilyClient] = None
@@ -62,13 +62,8 @@ _ASKNEWS_SEMAPHORE = asyncio.Semaphore(5)
 _ASKNEWS_OS_SEMAPHORE = asyncio.Semaphore(5)
 _PERPLEXITY_SEMAPHORE = asyncio.Semaphore(5)
 _GPT5_SEARCH_SEMAPHORE = asyncio.Semaphore(5)
-_GPT5_BASE_SEMAPHORE = asyncio.Semaphore(5)
 _TAVILY_SEMAPHORE = asyncio.Semaphore(5)
-_ASKNEWS_OS_MODEL_CANDIDATES = (
-    # Providers may expose this model with either namespaced or short identifier.
-    "openrouter/asknews/asknews-os",
-    "asknews/asknews-os",
-)
+_RING_FINANCE_SEMAPHORE = asyncio.Semaphore(5)
 _OPENROUTER_WEB_SEARCH_SEMAPHORE = asyncio.Semaphore(5)
 
 # â”€â”€â”€ Conservative tuning constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -185,18 +180,16 @@ def is_minibench_question(question: Any) -> bool:
     if slug and MINIBENCH_TOURNAMENT_SLUG in slug.lower():
         return True
 
+    # Intentionally do not classify numeric IDs (e.g., 33022) as minibench.
+    # Minibench routing is slug-based only.
     for attr in ("tournaments", "tournament", "project", "tournament_slug", "project_slug", "tournament_id", "project_id"):
         candidate = getattr(question, attr, None)
         if candidate is None:
             continue
         values = candidate if isinstance(candidate, (list, tuple, set)) else [candidate]
         for value in values:
-            if isinstance(value, (int, float)) and int(value) == MINIBENCH_TOURNAMENT_ID:
-                return True
-            if isinstance(value, str) and value.strip() == str(MINIBENCH_TOURNAMENT_ID):
-                return True
             text = _stringify_tournament_value(value)
-            if text and (MINIBENCH_TOURNAMENT_SLUG in text.lower() or text == str(MINIBENCH_TOURNAMENT_ID)):
+            if text and (MINIBENCH_TOURNAMENT_SLUG in text.lower()):
                 return True
     return False
 
@@ -259,7 +252,11 @@ Output a short research brief.
 
 
 async def research_perplexity(question: str) -> str:
-    for model_name in ("openrouter/perplexity/sonar-pro", "openrouter/perplexity/sonar"):
+    for model_name in (
+        "openrouter/perplexity/sonar-reasoning-pro",
+        "openrouter/perplexity/sonar-pro",
+        "openrouter/perplexity/sonar",
+    ):
         result = await _research_openrouter_search(question, model_name, "Perplexity", _PERPLEXITY_SEMAPHORE)
         if result:
             return result
@@ -270,16 +267,69 @@ async def research_gpt5_search(question: str) -> str:
     return await _research_openrouter_search(question, "openrouter/openai/gpt-5.5", "GPT-5", _GPT5_SEARCH_SEMAPHORE)
 
 
-async def research_gpt5_base(question: str) -> str:
-    return await _research_openrouter_search(question, "openrouter/openai/gpt-5", "GPT-5-Base", _GPT5_BASE_SEMAPHORE)
+async def research_ring_finance(question: str) -> str:
+    return await _research_openrouter_search(
+        question,
+        "openrouter/inclusionai/ring-2.6-1t:free",
+        "Ring Finance",
+        _RING_FINANCE_SEMAPHORE,
+    )
 
 
-async def research_asknews_os(question: str) -> str:
-    for model_name in _ASKNEWS_OS_MODEL_CANDIDATES:
-        result = await _research_openrouter_search(question, model_name, "AskNews OS", _ASKNEWS_OS_SEMAPHORE)
-        if result:
-            return result
-    return ""
+async def research_asknews_os(question: str, client_id: str, client_secret: str) -> str:
+    """Research using AskNews SDK directly (news + deepnews), not via OpenRouter."""
+    async with _ASKNEWS_OS_SEMAPHORE:
+        try:
+            ask = AsyncAskNewsSDK(
+                client_id=client_id,
+                client_secret=client_secret,
+                scopes=["chat", "news", "stories", "analytics"],
+            )
+
+            # Latest news snapshot
+            latest = await ask.news.search_news(
+                query=question,
+                n_articles=5,
+                return_type="both",
+                strategy="latest news",
+            )
+
+            # Historical/news-knowledge snapshot
+            historical = await ask.news.search_news(
+                query=question,
+                n_articles=10,
+                return_type="both",
+                strategy="news knowledge",
+            )
+
+            # Deep research synthesis
+            deep = await ask.chat.get_deep_news(
+                messages=[{"role": "user", "content": question}],
+                search_depth=2,
+                max_depth=2,
+                sources=["asknews"],
+                stream=False,
+                return_sources=False,
+                model="deepseek-basic",
+                inline_citations="numbered",
+            )
+
+            latest_text = getattr(latest, "as_string", "") or str(latest)
+            historical_text = getattr(historical, "as_string", "") or str(historical)
+            deep_text = str(deep or "")
+            combined = "\n\n".join(
+                part.strip()
+                for part in (latest_text, historical_text, deep_text)
+                if str(part).strip()
+            )
+
+            if not combined:
+                logger.warning("AskNews OS search returned empty result")
+                return ""
+            return f"=== AskNews Deep Search ===\n[AskNews OS Data]\n{combined}"
+        except Exception as e:
+            logger.warning(f"AskNews OS search failed: {e}")
+            return ""
 
 async def research_openrouter_web_search(question: str) -> str:
     """Research using OpenRouter's web_search server tool with model-driven search."""
@@ -632,7 +682,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         if ok("[AskNews OS Data]",    ["[AskNews OS search failed]"]):                            used.append("asknews_os")
         if ok("[Perplexity Data]",    ["[Perplexity search failed]"]):                            used.append("perplexity")
         if ok("[GPT-5 Data]",         ["[GPT-5 search failed]"]):                                 used.append("gpt5_search")
-        if ok("[GPT-5-Base Data]",    ["[GPT-5-Base search failed]"]):                            used.append("gpt5_base")
+        if ok("[Ring Finance Data]",  ["[Ring Finance search failed]"]):                          used.append("ring_finance")
         if ok("[LLM Web Research]",   ["[LLM web research failed]"]):                            used.append("llm_web")
         if ok("[Meta-Forecast]",      ["[Meta-forecast unavailable]"]):                          used.append("meta")
         return ",".join(used) if used else "none"
@@ -892,7 +942,10 @@ Output ONLY a JSON list: ["query1","query2","query3"]
 
     async def _run_asknews_os_search(self, query: str) -> str:
         try:
-            result = await research_asknews_os(query)
+            if not self.asknews_client_id or not self.asknews_client_secret:
+                logger.warning("AskNews OS search skipped: ASKNEWS_CLIENT_ID / ASKNEWS_CLIENT_SECRET is not configured")
+                return ""
+            result = await research_asknews_os(query, self.asknews_client_id, self.asknews_client_secret)
             if not result:
                 logger.warning("AskNews OS search returned no usable output")
                 return ""
@@ -976,8 +1029,9 @@ Fine print:
             queries = await self._optimize_search_query(question, decomp)
         optimized_query = " OR ".join(queries)
 
-    # Parallel research fan-out: Tavily, Exa, AskNews, AskNews OS, Perplexity,
-    # GPT-5 search, GPT-5 base, and OpenRouter Web Search
+        # Parallel research fan-out: Tavily, Exa, AskNews, AskNews OS, Perplexity,
+        # GPT-5 search, and OpenRouter Web Search.
+        # Finance questions also include Ring Finance.
         tasks   = [
             self._run_tavily_search(optimized_query),
             self._run_exa_search(optimized_query),
@@ -985,9 +1039,10 @@ Fine print:
             self._run_asknews_os_search(optimized_query),
             research_perplexity(optimized_query),
             research_gpt5_search(optimized_query),
-            research_gpt5_base(optimized_query),
             research_openrouter_web_search(optimized_query),
         ]
+        if route_name == "finance":
+            tasks.append(research_ring_finance(optimized_query))
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         cleaned: list[str] = []
