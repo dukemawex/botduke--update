@@ -573,6 +573,7 @@ class ForecastingPrinciples:
             "â€¢ Default toward base rates and prior probabilities.\n"
             "â€¢ gree by >0.20, treat the disagreement itself as uncertainty.\n"
             "â€¢ Prefer 60/40 over 80/20 when the decisive evidence is ambiguous.\n"
+            "â€¢ Good forecasters commit: do not hedge at 45-55%. If evidence leans one way, say so clearly.\n"
             "â€¢ Articulate at least 2 factors that could push the outcome the other way.\n"
             "â€¢ Never assign probability below 0.03 or above 0.97 without extraordinary evidence."
         )
