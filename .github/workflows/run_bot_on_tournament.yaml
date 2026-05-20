@@ -3,7 +3,7 @@ name: Forecast on new AI tournament questions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
+    - cron: "*/10 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -51,3 +51,4 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_CLIENT_SECRET: ${{ secrets.ASKNEWS_CLIENT_SECRET }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
