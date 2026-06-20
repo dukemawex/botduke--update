@@ -647,12 +647,12 @@ class SpringAdvancedForecastingBot(ForecastBot):
         """
         return {
             "default":         "openrouter/openai/gpt-5.5",
-            "parser":          "openrouter/openai/gpt-5-mini",
-            "summarizer":      "openrouter/openai/gpt-5-mini",
+            "parser":          "openrouter/anthropic/claude-haiku-4.5",
+            "summarizer":      "openrouter/deepseek/deepseek-v4-flash",
             "researcher":      "openrouter/perplexity/sonar-reasoning-pro",  # FIX: live web research
-            "query_optimizer": "openrouter/openai/gpt-5-mini",
+            "query_optimizer": "openrouter/openai/gpt-4o-mini",
             "critic":          "openrouter/anthropic/claude-opus-4.6",
-            "red_team":        "openrouter/anthropic/claude-sonnet-4.6",
+            "red_team":        "openrouter/openai/o3",
             "decomposer":      "openrouter/openai/gpt-5-mini",
         }
 
