@@ -646,12 +646,12 @@ class SpringAdvancedForecastingBot(ForecastBot):
         decomposer      | openrouter/openai/gpt-5-mini            | Simple decomposition
         """
         return {
-            "default":         "openrouter/openai/gpt-5.5",
+            "default":         "openrouter/openai/gpt-5.6-luna",
             "parser":          "openrouter/anthropic/claude-haiku-4.5",
             "summarizer":      "openrouter/deepseek/deepseek-v4-flash",
             "researcher":      "openrouter/perplexity/sonar-reasoning-pro",  # FIX: live web research
             "query_optimizer": "openrouter/openai/gpt-4o-mini",
-            "critic":          "openrouter/anthropic/claude-opus-4.6",
+            "critic":          "openrouter/openai/gpt-5.6-luna",
             "red_team":        "openrouter/openai/o3",
             "decomposer":      "openrouter/openai/gpt-5-mini",
         }
