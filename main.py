@@ -2418,7 +2418,7 @@ if __name__ == "__main__":
             seasonal, minibench, market_pulse = await asyncio.gather(
                 bot.forecast_on_tournament(CURRENT_AI_COMPETITION_ID,      return_exceptions=True),
                 bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID,    return_exceptions=True),
-                bot.forecast_on_tournament("market-pulse-26q2",            return_exceptions=True),
+                bot.forecast_on_tournament("market-pulse-26q3",            return_exceptions=True),
             )
             return seasonal + minibench + market_pulse
 
@@ -2436,7 +2436,7 @@ if __name__ == "__main__":
         questions = [client.get_question_by_url(url.strip()) for url in EXAMPLE_QUESTION_URLS]
         single_reports, market_pulse_q2_reports, summer_eval_reports = await asyncio.gather(
             bot.forecast_questions(questions,                              return_exceptions=True),
-            bot.forecast_on_tournament("market-pulse-26q2",               return_exceptions=True),
+            bot.forecast_on_tournament("market-pulse-26q3",               return_exceptions=True),
             bot.forecast_on_tournament("summer-futureeval-2026",          return_exceptions=True),
         )
         return single_reports + market_pulse_q2_reports + summer_eval_reports
