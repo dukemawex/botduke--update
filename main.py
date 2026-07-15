@@ -270,9 +270,9 @@ async def research_nimble(question: str) -> str:
     if not api_key:
         return ""
     try:
-        url = "https://api.webit.live/api/v1/realtime/search"
-        headers = {"Authorization": f"Basic {api_key}", "Content-Type": "application/json"}
-        payload = {"query": question, "search_engine": "google_search", "parse": True}
+        url = "https://sdk.nimbleway.com/v1/search"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {"query": question, "max_results": 8, "search_depth": "lite", "formats": ["markdown"]}
         timeout = aiohttp.ClientTimeout(total=25)
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.post(url, json=payload, headers=headers) as r:
@@ -280,14 +280,23 @@ async def research_nimble(question: str) -> str:
                     logger.warning(f"Nimble search HTTP {r.status}")
                     return ""
                 data = await r.json()
-        # extract organic snippets
-        parsing = (data or {}).get("parsing", {}) or {}
-        organic = parsing.get("organic_results") or parsing.get("organic") or []
+        # Nimble returns structured results; handle common shapes defensively.
+        results = (data or {}).get("results") or (data or {}).get("data") or []
+        if isinstance(data, dict) and not results:
+            # some responses nest under 'search'/'organic'
+            results = (data.get("search") or {}).get("results") or data.get("organic") or []
         snippets = []
-        for item in organic[:8]:
-            title = item.get("title", ""); snip = item.get("snippet") or item.get("description", "")
+        for item in (results or [])[:8]:
+            if isinstance(item, str):
+                snippets.append(f"- {item}"); continue
+            title = item.get("title", "")
+            snip = item.get("snippet") or item.get("description") or item.get("content") or ""
             if title or snip:
                 snippets.append(f"- {title}: {snip}")
+        # fallback: if Nimble returned a single markdown/text blob
+        if not snippets and isinstance(data, dict):
+            blob = data.get("markdown") or data.get("text") or ""
+            if blob: snippets.append(str(blob)[:2000])
         return "Nimble web results:\n" + "\n".join(snippets) if snippets else ""
     except Exception as e:
         logger.warning(f"Nimble search failed: {e}")
