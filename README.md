@@ -145,3 +145,13 @@ Run-log verification showed **Tavily** (bad call signature), **AskNews** (SDK in
 - **You.com Search** (`YOUCOM_API_KEY`)
 
 Active research fan-out is now: Exa · Perplexity (OpenRouter) · GPT-5.1 web search · GPT-5.1 web_search tool · **Nimble** · **You.com**. Add `YOUCOM_API_KEY` in repo Settings → Secrets → Actions.
+
+## Update (2026-07): cost-optimized OpenRouter models
+
+Swapped the ensemble and role models to cheap-but-top-tier verified OpenRouter IDs:
+- **Forecast ensemble:** gpt-5.6-luna ($1/$6) · deepseek-v4-pro ($0.44/$0.87) · kimi-k2.6 ($0.66/$3.41) · claude-haiku-4.5 · perplexity/sonar-pro
+- **Synthesis / critic / default:** gpt-5.6-luna (replaces pricier gpt-5.5)
+- **Red-team:** deepseek-v4-pro (replaces o3)
+- **Utility (parser/summarizer/query/decomposer):** gpt-5-mini · deepseek-v4-flash · gpt-4o-mini
+
+Weights unchanged (0.30/0.25/0.20/0.15/0.10, luna highest). All IDs verified live on OpenRouter to avoid the silent-failure trap that hit gpt-5.5-online.

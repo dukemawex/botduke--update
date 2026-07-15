@@ -136,7 +136,7 @@ Rules:
 - Do not include markdown/code fences.
 """)
 
-        for model_name in ("openrouter/openai/gpt-5.5", "openrouter/openai/gpt-5.1"):  # FIX: dropped invalid gpt-5.5-online
+        for model_name in ("openrouter/openai/gpt-5.6-luna", "openrouter/deepseek/deepseek-v4-pro"):  # cheap top-tier
             try:
                 llm = GeneralLlm(model=model_name, temperature=0)
                 raw = await llm.invoke(prompt)

@@ -79,11 +79,11 @@ _RECENT_PREDICTIONS_CAP    = 20    # prevent unbounded list growth
 # and explicit weighting in the aggregation step.
 # Perplexity sonar-pro added as a research-aware forecaster (has live web context).
 _FORECAST_ENSEMBLE = [
-    "openrouter/openai/gpt-5.1",           # primary – highest leverage (confirmed working)
-    "openrouter/openai/gpt-5.5",           # strong general reasoning
-    "openrouter/anthropic/claude-opus-4.6", # best adversarial reasoning
-    "openrouter/anthropic/claude-sonnet-4.6", # diverse from Opus
-    "openrouter/perplexity/sonar-pro",     # online model – brings live web context to forecasting
+    "openrouter/openai/gpt-5.6-luna",        # primary – cheap top-tier ($1/$6), 1M ctx, reasoning
+    "openrouter/deepseek/deepseek-v4-pro",   # cheapest strong reasoner ($0.44/$0.87)
+    "openrouter/moonshotai/kimi-k2.6",       # diverse architecture ($0.66/$3.41)
+    "openrouter/anthropic/claude-haiku-4.5", # cheap Anthropic for adversarial diversity
+    "openrouter/perplexity/sonar-pro",       # online model – live web context
 ]
 
 # Weights aligned to ensemble order above.
@@ -733,14 +733,14 @@ class SpringAdvancedForecastingBot(ForecastBot):
         decomposer      | openrouter/openai/gpt-5-mini            | Simple decomposition
         """
         return {
-            "default":         "openrouter/openai/gpt-5.6-luna",
-            "parser":          "openrouter/anthropic/claude-haiku-4.5",
-            "summarizer":      "openrouter/deepseek/deepseek-v4-flash",
-            "researcher":      "openrouter/perplexity/sonar-reasoning-pro",  # FIX: live web research
-            "query_optimizer": "openrouter/openai/gpt-4o-mini",
-            "critic":          "openrouter/openai/gpt-5.6-luna",
-            "red_team":        "openrouter/openai/o3",
-            "decomposer":      "openrouter/openai/gpt-5-mini",
+            "default":         "openrouter/openai/gpt-5.6-luna",              # cheap top-tier
+            "parser":          "openrouter/openai/gpt-5-mini",                 # fast structured extraction
+            "summarizer":      "openrouter/deepseek/deepseek-v4-flash",        # cheapest summariser
+            "researcher":      "openrouter/perplexity/sonar-reasoning-pro",    # live web + CoT
+            "query_optimizer": "openrouter/openai/gpt-4o-mini",                # cheap query rewrite
+            "critic":          "openrouter/openai/gpt-5.6-luna",               # cheap capable critic
+            "red_team":        "openrouter/deepseek/deepseek-v4-pro",          # cheap, diverse adversary (was o3)
+            "decomposer":      "openrouter/openai/gpt-5-mini",                 # cheap decomposition
         }
 
     def get_synthesis_model(self) -> str:
@@ -749,7 +749,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         Return a confirmed-working model for synthesis tasks.
         Callers should pass this to ForecastingEnhancer.synthesize_research().
         """
-        return "openrouter/openai/gpt-5.5"
+        return "openrouter/openai/gpt-5.6-luna"  # cheap top-tier synthesis
 
     # ── Research quality helpers ─────────────────────────────────────────────
 
@@ -1516,8 +1516,8 @@ Answer YES or NO only.
         src = self._search_footprint(research)
         return (
             f"[{self.bot_name}] sources({src}); "
-            f"ensemble(gpt-5.1×0.30 + gpt-5.5×0.25 + claude-opus×0.20 + "
-            f"claude-sonnet×0.15 + sonar-pro×0.10); "
+            f"ensemble(gpt-5.6-luna×0.30 + deepseek-v4-pro×0.25 + kimi-k2.6×0.20 + "
+            f"claude-haiku×0.15 + sonar-pro×0.10); "
             f"extremize cap={_MAX_EXTREMIZE_STRENGTH}; "
             f"spread-shrink thresholds={_HIGH_SPREAD_SHRINK_THRESH}/{_MED_SPREAD_SHRINK_THRESH}."
         )
