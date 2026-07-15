@@ -26,6 +26,29 @@ except Exception:
     _HAS_COGNEE = False
 
 
+def _cognee_ready() -> bool:
+    return _USE_COGNEE and _HAS_COGNEE
+
+
+async def _cognee_add(text: str) -> None:
+    """Feed a resolved forecast into Cognee's knowledge graph (best-effort, async)."""
+    try:
+        await cognee.add(text)
+        await cognee.cognify()
+    except Exception:
+        pass
+
+
+async def _cognee_search(query: str) -> str:
+    try:
+        res = await cognee.search(query_text=query)
+        if isinstance(res, list):
+            return "\n".join(str(r) for r in res[:5])
+        return str(res)
+    except Exception:
+        return ""
+
+
 def _embed(texts: List[str]) -> Optional[List[List[float]]]:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
@@ -150,6 +173,16 @@ class ForecastMemory:
             verdict = ("✓ correct" if s["was_correct"] else "✗ WRONG") if s["was_correct"] is not None else "resolved"
             lines.append(f"- (sim {s['similarity']}) '{s['question'][:120]}' — you forecast "
                          f"{s['past_forecast']:.2f}, resolved {s['resolution']} [{verdict}]")
+        # Cognee knowledge-graph recall (richer cross-question reasoning) when enabled
+        if _cognee_ready():
+            try:
+                import asyncio as _a
+                cg = _a.get_event_loop().run_until_complete(_cognee_search(question_text)) \
+                    if not _a.get_event_loop().is_running() else ""
+                if cg:
+                    lines.append("\n## Cognee knowledge-graph recall\n" + cg[:1200])
+            except Exception:
+                pass
         cal = self.calibration_summary()
         if cal.get("n"):
             lines.append(f"\nYour track record so far: {cal['n']} resolved, "

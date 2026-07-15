@@ -30,6 +30,8 @@ jobs:
           installer-parallel: true
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
+      - name: Install runtime extras (cognee, aiohttp)
+        run: poetry run pip install cognee aiohttp
       - name: Run bot
         run: |
           poetry run python main.py --mode metaculus_cup
@@ -44,3 +46,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_CLIENT_SECRET: ${{ secrets.ASKNEWS_CLIENT_SECRET }}
+          NIMBLE_API_KEY: ${{ secrets.NIMBLE_API_KEY }}
+          USE_COGNEE: "1"
+          COGNEE_LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FORECAST_MEMORY_PATH: "forecast_memory.jsonl"

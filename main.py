@@ -2104,8 +2104,14 @@ OUTPUT ONLY JSON:
             logger.debug(f"Scenario & uncertainty integration failed: {e}")
 
         try:
-            self.memory.remember_forecast(question.question_text, final_p, research[:2000],
-                                          meta={"applied": applied})
+            _qmeta = {"applied": applied}
+            for _attr in ("id_of_post", "id", "post_id", "question_id"):
+                _v = getattr(question, _attr, None)
+                if _v is not None:
+                    _qmeta["metaculus_id"] = _v; break
+            _url = getattr(question, "page_url", None) or getattr(question, "url", None)
+            if _url: _qmeta["url"] = _url
+            self.memory.remember_forecast(question.question_text, final_p, research[:2000], meta=_qmeta)
         except Exception as _e:
             logger.debug(f"memory write skipped: {_e}")
 
