@@ -228,6 +228,39 @@ def _get_tavily_client() -> Optional[AsyncTavilyClient]:
     return _TAVILY_CLIENT
 
 
+async def research_youcom(question: str) -> str:
+    """You.com Search API research tier. Enabled when YOUCOM_API_KEY is set.
+    Uses the You.com Search endpoint; degrades to empty string on any failure."""
+    import aiohttp
+    api_key = os.getenv("YOUCOM_API_KEY")
+    if not api_key:
+        return ""
+    try:
+        url = "https://api.ydc-index.io/search"
+        headers = {"X-API-Key": api_key}
+        params = {"query": question}
+        timeout = aiohttp.ClientTimeout(total=25)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url, headers=headers, params=params) as r:
+                if r.status != 200:
+                    logger.warning(f"You.com search HTTP {r.status}")
+                    return ""
+                data = await r.json()
+        hits = (data or {}).get("hits", []) or []
+        snippets = []
+        for h in hits[:8]:
+            title = h.get("title", "")
+            desc = h.get("description", "")
+            snips = " ".join(h.get("snippets", []) or [])
+            body = (desc + " " + snips).strip()
+            if title or body:
+                snippets.append(f"- {title}: {body}")
+        return "You.com web results:\n" + "\n".join(snippets) if snippets else ""
+    except Exception as e:
+        logger.warning(f"You.com search failed: {e}")
+        return ""
+
+
 async def research_nimble(question: str) -> str:
     """Nimble web research tier (optional). Enabled when NIMBLE_API_KEY is set.
     Uses Nimble's web retrieval API; degrades to empty string on any failure so it
@@ -1094,14 +1127,12 @@ Fine print:
         # AND via _run_llm_web_research() (which uses the researcher LLM role).
         # This guarantees a live-web Perplexity result even if one path fails.
         tasks = [
-            self._run_tavily_search(optimized_query),
-            self._run_exa_search(optimized_query),
-            self._run_asknews_search(optimized_query),
-            self._run_asknews_os_search(optimized_query),
-            research_perplexity(optimized_query),   # standalone Perplexity path
-            research_gpt5_search(optimized_query),  # gpt-5.1 web search
-            research_openrouter_web_search(optimized_query),  # gpt-5.1 with web_search tool
-            research_nimble(optimized_query),  # Nimble supplementary research tier (optional)
+            self._run_exa_search(optimized_query),                 # Exa (working)
+            research_perplexity(optimized_query),                  # Perplexity via OpenRouter (working)
+            research_gpt5_search(optimized_query),                 # gpt-5.1 web search
+            research_openrouter_web_search(optimized_query),       # gpt-5.1 web_search tool
+            research_nimble(optimized_query),                      # Nimble (replaces AskNews)
+            research_youcom(optimized_query),                      # You.com (replaces Tavily)
         ]
         if route_name == "finance":
             tasks.append(research_ring_finance(optimized_query))

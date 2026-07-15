@@ -137,3 +137,11 @@ source .venv/bin/activate  # macOS/Linux
 5. **`--minibench-biweekly` flag** — profile hook for topping the biweekly minibench.
 
 **Honest note:** calibration + memory are the real accuracy levers; Nimble is supplementary (already 6 sources). Score recovery depends most on the recalibration and on accumulating resolved-question memory over several cycles.
+
+## Update (2026-07): research sources — Nimble + You.com
+
+Run-log verification showed **Tavily** (bad call signature), **AskNews** (SDK incompatibility), and **AskNews OS** (401 auth) were silently failing every run — the bot was effectively forecasting on ~2 sources. Per decision, these are **replaced** by:
+- **Nimble** (`NIMBLE_API_KEY`)
+- **You.com Search** (`YOUCOM_API_KEY`)
+
+Active research fan-out is now: Exa · Perplexity (OpenRouter) · GPT-5.1 web search · GPT-5.1 web_search tool · **Nimble** · **You.com**. Add `YOUCOM_API_KEY` in repo Settings → Secrets → Actions.
