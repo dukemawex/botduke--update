@@ -268,11 +268,19 @@ async def research_tavily(question: str) -> str:
         return ""
     async with _TAVILY_SEMAPHORE:
         try:
-            result = await client.search(question, search_depth="advanced", max_tokens=4000)
-            if not result:
+            # tavily-python returns a dict with "results"; it does NOT accept max_tokens.
+            resp = await client.search(question, search_depth="advanced", max_results=6)
+            if not resp:
                 return ""
-            return result.strip() if isinstance(result, str) else str(result).strip()
-        except BaseException as e:
+            if isinstance(resp, dict):
+                parts = []
+                if resp.get("answer"):
+                    parts.append(f"Answer: {resp['answer']}")
+                for r in (resp.get("results") or [])[:6]:
+                    parts.append(f"- {r.get('title','')}: {r.get('content','')}")
+                return "\n".join(parts).strip()
+            return str(resp).strip()
+        except Exception as e:
             logger.warning(f"Tavily search failed: {e}")
             return ""
 
@@ -970,14 +978,21 @@ Output ONLY a JSON list: ["query1","query2","query3"]
             if not self.asknews_client_id or not self.asknews_client_secret:
                 return ""
             try:
-                searcher = AskNewsSearcher(
+                # FIX: the forecasting_tools AskNewsSearcher wrapper is incompatible with the
+                # installed asknews SDK (passes api_key= to AsyncClient). Use the SDK directly,
+                # mirroring the working research_asknews_os() path.
+                ask = AsyncAskNewsSDK(
                     client_id=self.asknews_client_id,
                     client_secret=self.asknews_client_secret,
+                    scopes=["news", "stories"],
                 )
-                result = await searcher.get_formatted_news_async(query)
-                if not str(result).strip():
+                latest = await ask.news.search_news(
+                    query=query, n_articles=6, return_type="string", strategy="latest news",
+                )
+                text = getattr(latest, "as_string", "") or str(latest)
+                if not text.strip():
                     return ""
-                return f"=== AskNews Search ===\n[AskNews Data]\n{result}"
+                return f"=== AskNews Search ===\n[AskNews Data]\n{text}"
             except Exception as e:
                 logger.warning(f"AskNews search failed: {e}")
                 return ""
