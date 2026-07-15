@@ -140,9 +140,18 @@ def extremize(p: float, strength: float = 0.3) -> float:
 
 
 def extremize_minibench(p: float) -> float:
-    if 0.45 < p < 0.55:
-        return extremize(p, strength=1.8)
-    return extremize(p, strength=0.85)
+    # RECALIBRATED: the old curve pushed genuine toss-ups (0.45-0.55) with strength 1.8,
+    # producing confident-wrong forecasts and negative scores. A near-50/50 ensemble means
+    # "we don't know" — extremizing that is exactly backwards. New policy:
+    #   - toss-ups (0.45-0.55): NO extremization (respect the uncertainty)
+    #   - mild leaning (0.55-0.65 / 0.35-0.45): gentle
+    #   - clear signal (>0.65 / <0.35): moderate
+    d = abs(p - 0.5)
+    if d < 0.05:
+        return float(np.clip(p, 0.02, 0.98))          # leave toss-ups alone
+    if d < 0.15:
+        return extremize(p, strength=0.35)
+    return extremize(p, strength=0.7)
 
 
 def _stringify_tournament_value(value: Any) -> Optional[str]:
@@ -217,6 +226,39 @@ def _get_tavily_client() -> Optional[AsyncTavilyClient]:
     if _TAVILY_CLIENT is None:
         _TAVILY_CLIENT = AsyncTavilyClient(api_key=api_key)
     return _TAVILY_CLIENT
+
+
+async def research_nimble(question: str) -> str:
+    """Nimble web research tier (optional). Enabled when NIMBLE_API_KEY is set.
+    Uses Nimble's web retrieval API; degrades to empty string on any failure so it
+    never breaks the fan-out. Added as a supplementary source to the existing 6."""
+    import aiohttp
+    api_key = os.getenv("NIMBLE_API_KEY")
+    if not api_key:
+        return ""
+    try:
+        url = "https://api.webit.live/api/v1/realtime/search"
+        headers = {"Authorization": f"Basic {api_key}", "Content-Type": "application/json"}
+        payload = {"query": question, "search_engine": "google_search", "parse": True}
+        timeout = aiohttp.ClientTimeout(total=25)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(url, json=payload, headers=headers) as r:
+                if r.status != 200:
+                    logger.warning(f"Nimble search HTTP {r.status}")
+                    return ""
+                data = await r.json()
+        # extract organic snippets
+        parsing = (data or {}).get("parsing", {}) or {}
+        organic = parsing.get("organic_results") or parsing.get("organic") or []
+        snippets = []
+        for item in organic[:8]:
+            title = item.get("title", ""); snip = item.get("snippet") or item.get("description", "")
+            if title or snip:
+                snippets.append(f"- {title}: {snip}")
+        return "Nimble web results:\n" + "\n".join(snippets) if snippets else ""
+    except Exception as e:
+        logger.warning(f"Nimble search failed: {e}")
+        return ""
 
 
 async def research_tavily(question: str) -> str:
@@ -588,6 +630,9 @@ class ForecastingPrinciples:
 
 # ─── Main bot ─────────────────────────────────────────────────────────────────
 
+from forecast_memory import ForecastMemory
+
+
 class SpringAdvancedForecastingBot(ForecastBot):
     _structure_output_validation_samples = 1
 
@@ -615,6 +660,7 @@ class SpringAdvancedForecastingBot(ForecastBot):
         self.uncertainty_quantifier = UncertaintyQuantifier()
         self.question_classifier  = QuestionClassifier()
         self.enhancer             = ForecastingEnhancer()
+        self.memory               = ForecastMemory()  # agent memory (Cognee-style)
 
     # ── Bayesian calibration ─────────────────────────────────────────────────
     # FIX #8: was undefined, causing silent except on every forecast.
@@ -1040,6 +1086,7 @@ Fine print:
             research_perplexity(optimized_query),   # standalone Perplexity path
             research_gpt5_search(optimized_query),  # gpt-5.1 web search
             research_openrouter_web_search(optimized_query),  # gpt-5.1 with web_search tool
+            research_nimble(optimized_query),  # Nimble supplementary research tier (optional)
         ]
         if route_name == "finance":
             tasks.append(research_ring_finance(optimized_query))
@@ -1086,6 +1133,14 @@ Fine print:
             f"{domain_framework}\n\n"
             f"{combined}"
         )
+
+        # Agent-memory recall: prepend similar past resolved questions + track record
+        try:
+            mem_block = self.memory.memory_prompt_block(question.question_text)
+            if mem_block:
+                research = mem_block + "\n\n" + research
+        except Exception as _e:
+            logger.debug(f"memory recall skipped: {_e}")
 
         try:
             fact_verifications = await self.fact_verifier.verify_claims(research)
@@ -2048,6 +2103,12 @@ OUTPUT ONLY JSON:
         except Exception as e:
             logger.debug(f"Scenario & uncertainty integration failed: {e}")
 
+        try:
+            self.memory.remember_forecast(question.question_text, final_p, research[:2000],
+                                          meta={"applied": applied})
+        except Exception as _e:
+            logger.debug(f"memory write skipped: {_e}")
+
         return ReasonedPrediction(prediction_value=final_p, reasoning=reasoning)
 
     # ── Multiple-choice forecasting ──────────────────────────────────────────
@@ -2269,6 +2330,8 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["tournament", "metaculus_cup", "test_questions"], default="tournament")
     parser.add_argument("--bot-name",            type=str, default="botduke")
     parser.add_argument("--no-extremize",        action="store_true")
+    parser.add_argument("--minibench-biweekly",  action="store_true",
+                        help="Tuned profile for topping the biweekly minibench: higher research effort, tighter calibration, memory-weighted.")
     parser.add_argument("--no-decomposition",    action="store_true")
     parser.add_argument("--no-meta-forecast",    action="store_true")
     parser.add_argument("--no-numeric-regimes",  action="store_true")

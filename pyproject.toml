@@ -17,6 +17,7 @@ python-dotenv = "^1.0.1"
 tavily-python = "^0.7.17"
 forecasting-tools = "^0.2.54"
 tavily = "^1.1.0"
+aiohttp = "^3.10.0"
 
 
 [tool.poetry.group.dev.dependencies]

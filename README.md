@@ -123,3 +123,17 @@ All three tournaments run in parallel during forecasting batch mode.
 python -m venv .venv
 source .venv/bin/activate  # macOS/Linux
 # .venv\Scripts\activate   # Windows
+
+---
+
+## Update (2026-07): calibration, memory, Nimble, minibench profile
+
+**Motivation:** a negative tournament score is a calibration problem first — the bot was too confident on genuine toss-ups.
+
+1. **Recalibrated extremization** — the old minibench curve pushed near-50/50 forecasts with strength 1.8 (confident-wrong). New policy: leave toss-ups (0.45–0.55) unextremized, gentle for mild leanings, moderate only for clear signals. *This is the highest-impact change for the negative score.*
+2. **Agent memory (`forecast_memory.py`, Cognee-style)** — stores every forecast + research + eventual resolution; recalls the most similar past resolved questions (semantic if `OPENAI_API_KEY` set, else keyword) and injects them plus a live Brier/hit-rate track record into the forecasting prompt. Optional Cognee backend via `USE_COGNEE=1`. Learns hit/miss over time.
+3. **`sync_resolutions.py`** — pulls resolved questions back into memory so calibration accumulates (run after each scoring window).
+4. **Nimble research tier** — `research_nimble()` added to the parallel fan-out (enabled by `NIMBLE_API_KEY`); degrades safely to empty on failure.
+5. **`--minibench-biweekly` flag** — profile hook for topping the biweekly minibench.
+
+**Honest note:** calibration + memory are the real accuracy levers; Nimble is supplementary (already 6 sources). Score recovery depends most on the recalibration and on accumulating resolved-question memory over several cycles.
