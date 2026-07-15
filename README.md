@@ -155,3 +155,6 @@ Swapped the ensemble and role models to cheap-but-top-tier verified OpenRouter I
 - **Utility (parser/summarizer/query/decomposer):** gpt-5-mini · deepseek-v4-flash · gpt-4o-mini
 
 Weights unchanged (0.30/0.25/0.20/0.15/0.10, luna highest). All IDs verified live on OpenRouter to avoid the silent-failure trap that hit gpt-5.5-online.
+
+## Model knowledge-cutoff logging (2026-07)
+Each forecast now carries the ensemble's measured knowledge cutoffs (via `cutoff_probe.py`, dated-event bisection). Because botduke injects **live research** (Exa/Perplexity/Nimble/You.com), the effective information horizon exceeds these parametric cutoffs — the cutoff is a floor on unaided recall, and retrieval covers the grey zone. Refresh cache: `python cutoff_probe.py <model_ids...>`.

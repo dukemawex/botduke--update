@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import os
+import cutoff_probe
 import re
 import json
 from dataclasses import dataclass, field
@@ -1171,6 +1172,17 @@ Fine print:
         meta_block = await self._run_meta_forecast_lookup(question)
         if meta_block:
             combined = combined + "\n\n" + meta_block
+
+        # Attach measured model cutoffs (cached) so forecasts note the parametric horizon.
+        # botduke augments this with live research, so effective horizon exceeds these dates.
+        try:
+            import json as _json, os as _os
+            _cache=_os.getenv("CUTOFF_CACHE_PATH","cutoff_cache.json")
+            if _os.path.exists(_cache):
+                _cf=_json.load(open(_cache))
+                combined = combined + "\n\n" + cutoff_probe.cutoff_caveat_block(_cf)
+        except Exception:
+            pass
 
         # FIX #1: pass synthesis_model explicitly so enhancer uses gpt-5.5, not gpt-5.5-online
         synthesis = await self.enhancer.synthesize_research(
