@@ -1131,10 +1131,17 @@ Fine print:
             research_perplexity(optimized_query),                  # Perplexity via OpenRouter (working)
             research_gpt5_search(optimized_query),                 # gpt-5.1 web search
             research_openrouter_web_search(optimized_query),       # gpt-5.1 web_search tool
-            research_nimble(optimized_query),                      # Nimble (replaces AskNews)
-            research_youcom(optimized_query),                      # You.com (replaces Tavily)
+            research_nimble(optimized_query),                      # Nimble (general web research)
         ]
-        if route_name == "finance":
+        # You.com is used MOSTLY for finance/market questions (per config): gate on the
+        # finance route, with a keyword fallback for finance Qs the router may miss.
+        _finance_kw = ("stock", "market", "price", "inflation", "gdp", "fed", "interest rate",
+                       "crypto", "bitcoin", "earnings", "revenue", "recession", "currency",
+                       "bond", "yield", "s&p", "nasdaq", "dow", "economic", "economy", "trade")
+        _is_finance = (route_name == "finance") or any(
+            k in question.question_text.lower() for k in _finance_kw)
+        if _is_finance:
+            tasks.append(research_youcom(optimized_query))         # You.com — finance-focused
             tasks.append(research_ring_finance(optimized_query))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)

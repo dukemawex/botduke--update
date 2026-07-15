@@ -144,7 +144,7 @@ Run-log verification showed **Tavily** (bad call signature), **AskNews** (SDK in
 - **Nimble** (`NIMBLE_API_KEY`)
 - **You.com Search** (`YOUCOM_API_KEY`)
 
-Active research fan-out is now: Exa · Perplexity (OpenRouter) · GPT-5.1 web search · GPT-5.1 web_search tool · **Nimble** · **You.com**. Add `YOUCOM_API_KEY` in repo Settings → Secrets → Actions.
+Active research fan-out: Exa · Perplexity (OpenRouter) · GPT-5.1 web search · GPT-5.1 web_search tool · **Nimble** (general). **You.com is finance-focused** — it fires only on finance-routed questions or finance keywords (stock, market, inflation, crypto, GDP, Fed, etc.), alongside Ring Finance. Add `YOUCOM_API_KEY` in repo Settings → Secrets → Actions.
 
 ## Update (2026-07): cost-optimized OpenRouter models
 
