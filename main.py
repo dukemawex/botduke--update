@@ -2433,7 +2433,7 @@ if __name__ == "__main__":
         predictions_per_research_report=1,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
-        skip_previously_forecasted_questions=False,
+        skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         bot_name=args.bot_name,
         flags=flags,
