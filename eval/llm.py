@@ -6,10 +6,14 @@ OpenAI-compatible. That means a plain OpenAI client with a custom base_url,
 not the classic azure `deployments/<name>/chat/completions?api-version=` route.
 Deployment name is passed as the model.
 
-Env:
-    AZURE_API_KEY     required
-    AZURE_BASE_URL    default: the Foundry v1 base for this project
-    AZURE_DEPLOYMENT  default: gpt-5.6-sol
+Provider is switchable so the harness is not hostage to one account:
+
+    LLM_PROVIDER=azure       AZURE_API_KEY, AZURE_BASE_URL, AZURE_DEPLOYMENT
+    LLM_PROVIDER=openrouter  OPENROUTER_API_KEY, OPENROUTER_MODEL
+
+Both speak the same OpenAI-compatible chat/completions shape, so stage 1 does
+not care which one is behind it. Keep the provider fixed within a single sweep;
+comparing configs across providers measures the provider, not the config.
 """
 from __future__ import annotations
 import os, re, json
@@ -18,15 +22,25 @@ import requests
 
 DEFAULT_BASE = "https://emmanuelduke243689-6684-resource.services.ai.azure.com/openai/v1"
 DEFAULT_DEPLOYMENT = "gpt-5.6-sol"
+OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+DEFAULT_OR_MODEL = "openai/gpt-5.6-luna"
 
 
 def _cfg() -> tuple[str, str, str]:
+    provider = os.environ.get("LLM_PROVIDER", "azure").lower()
+    if provider == "openrouter":
+        key = os.environ.get("OPENROUTER_API_KEY")
+        if not key:
+            raise RuntimeError("LLM_PROVIDER=openrouter but OPENROUTER_API_KEY not set")
+        return (key,
+                os.environ.get("OPENROUTER_BASE_URL", OPENROUTER_BASE).rstrip("/"),
+                os.environ.get("OPENROUTER_MODEL", DEFAULT_OR_MODEL))
     key = os.environ.get("AZURE_API_KEY")
     if not key:
-        raise RuntimeError("AZURE_API_KEY not set")
-    base = os.environ.get("AZURE_BASE_URL", DEFAULT_BASE).rstrip("/")
-    dep = os.environ.get("AZURE_DEPLOYMENT", DEFAULT_DEPLOYMENT)
-    return key, base, dep
+        raise RuntimeError("AZURE_API_KEY not set (or set LLM_PROVIDER=openrouter)")
+    return (key,
+            os.environ.get("AZURE_BASE_URL", DEFAULT_BASE).rstrip("/"),
+            os.environ.get("AZURE_DEPLOYMENT", DEFAULT_DEPLOYMENT))
 
 
 def complete(prompt: str, temperature: float = 0.3, max_tokens: int = 1200,
