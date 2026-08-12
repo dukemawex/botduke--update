@@ -1,0 +1,3 @@
+0 cached, 130 to run
+3 cached, 120 to run
+  member fail 44861: no choices in 200 response: {"error": {"message": "Upstream error from Darkbloom: inference failed after 2 attempt(s): provider disconnected", "code": 502}}

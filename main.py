@@ -56,7 +56,6 @@ LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 
 CURRENT_AI_COMPETITION_ID = 33022
-MINIBENCH_TOURNAMENT_SLUG = "minibench"
 
 _TAVILY_CLIENT: Optional[AsyncTavilyClient] = None
 _ASKNEWS_SEMAPHORE         = asyncio.Semaphore(5)
@@ -139,84 +138,6 @@ def extremize(p: float, strength: float = 0.3) -> float:
     extremized_p     = extremized_odds / (1 + extremized_odds)
     return float(np.clip(extremized_p, 0.01, 0.99))
 
-
-def extremize_minibench(p: float) -> float:
-    # RECALIBRATED: the old curve pushed genuine toss-ups (0.45-0.55) with strength 1.8,
-    # producing confident-wrong forecasts and negative scores. A near-50/50 ensemble means
-    # "we don't know" — extremizing that is exactly backwards. New policy:
-    #   - toss-ups (0.45-0.55): NO extremization (respect the uncertainty)
-    #   - mild leaning (0.55-0.65 / 0.35-0.45): gentle
-    #   - clear signal (>0.65 / <0.35): moderate
-    d = abs(p - 0.5)
-    if d < 0.05:
-        return float(np.clip(p, 0.02, 0.98))          # leave toss-ups alone
-    if d < 0.15:
-        return extremize(p, strength=0.35)
-    return extremize(p, strength=0.7)
-
-
-def _stringify_tournament_value(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (int, float)):
-        return str(int(value)) if float(value).is_integer() else str(value)
-    for attr in ("slug", "id", "project", "tournament", "name"):
-        nested = getattr(value, attr, None)
-        if nested is not None:
-            text = _stringify_tournament_value(nested)
-            if text:
-                return text
-    if isinstance(value, dict):
-        for key in ("slug", "id", "project", "tournament", "name"):
-            if key in value:
-                text = _stringify_tournament_value(value[key])
-                if text:
-                    return text
-    return None
-
-
-def get_question_tournament_slug(question: Any) -> Optional[str]:
-    candidates = [
-        getattr(question, "tournaments",      None),
-        getattr(question, "tournament",       None),
-        getattr(question, "project",          None),
-        getattr(question, "tournament_slug",  None),
-        getattr(question, "project_slug",     None),
-        getattr(question, "tournament_id",    None),
-        getattr(question, "project_id",       None),
-    ]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        if isinstance(candidate, (list, tuple, set)):
-            for item in candidate:
-                text = _stringify_tournament_value(item)
-                if text:
-                    return text
-        else:
-            text = _stringify_tournament_value(candidate)
-            if text:
-                return text
-    return None
-
-
-def is_minibench_question(question: Any) -> bool:
-    slug = get_question_tournament_slug(question)
-    if slug and MINIBENCH_TOURNAMENT_SLUG in slug.lower():
-        return True
-    for attr in ("tournaments", "tournament", "project", "tournament_slug",
-                 "project_slug", "tournament_id", "project_id"):
-        candidate = getattr(question, attr, None)
-        if candidate is None:
-            continue
-        values = candidate if isinstance(candidate, (list, tuple, set)) else [candidate]
-        for value in values:
-            text = _stringify_tournament_value(value)
-            if text and (MINIBENCH_TOURNAMENT_SLUG in text.lower()):
-                return True
-    return False
 
 
 def _get_tavily_client() -> Optional[AsyncTavilyClient]:
@@ -578,6 +499,9 @@ class NumericRegime(str, Enum):
 @dataclass
 class BotFeatureFlags:
     enable_extremize:          bool = True
+    # Optional fixed roster for controlled experiments. A one-item roster
+    # bypasses critic/red-team voting and uses that model's forecast directly.
+    forecast_model_names:      Optional[tuple[str, ...]] = None
     enable_decomposition:      bool = True
     enable_meta_forecast:      bool = True
     enable_numeric_regimes:    bool = True
@@ -1188,8 +1112,7 @@ Fine print:
         synthesis = await self.enhancer.synthesize_research(
             question.question_text,
             combined,
-            # If ForecastingEnhancer accepts a model kwarg, pass it here:
-            # model=self.get_synthesis_model(),
+            model_name=self.get_synthesis_model(),
         )
         combined = (
             f"{combined}\n\n"
@@ -2001,23 +1924,29 @@ Percentile 90: XX
     ) -> ReasonedPrediction[float]:
         self._ensure_some_research_or_raise(research)
 
-        # FIX: use global _FORECAST_ENSEMBLE so gpt-5.1 (highest weight) is always present.
-        # Perplexity sonar-pro is the 5th model, adding live-web context to the vote.
-        results = await self._collect_model_forecasts(_FORECAST_ENSEMBLE, question, research)
+        model_names = list(self.flags.forecast_model_names or _FORECAST_ENSEMBLE)
+        # A one-model run is intentional: it is a clean FutureSearch-style
+        # research + forecaster path, not a disguised ensemble with duplicate
+        # critic/red-team opinions.
+        results = await self._collect_model_forecasts(model_names, question, research)
         if not results:
             raise RuntimeError("No model forecasts available for binary prediction.")
 
         model_probs = [float(r.prediction_in_decimal) for r in results]
 
-        # FIX: use weighted median — gpt-5.1 carries 0.30 weight
         model_weighted = self._weighted_ensemble_median(model_probs)
+        single_model = len(model_probs) == 1
 
         forecast_map           = {f"model_{i}": p for i, p in enumerate(model_probs)}
         forecast_map["model_weighted"] = model_weighted
         spread = max(model_probs) - min(model_probs) if len(model_probs) > 1 else 0.0
 
-        critic_llm = self.get_llm("critic", "llm")
-        critique   = await critic_llm.invoke(clean_indents(f"""
+        if single_model:
+            raw_p = model_probs[0]
+            red_teamed_p = raw_p
+        else:
+            critic_llm = self.get_llm("critic", "llm")
+            critique = await critic_llm.invoke(clean_indents(f"""
 You are a conservative critic reviewing an ensemble forecast.
 Question: {question.question_text}
 Research:
@@ -2030,14 +1959,13 @@ Ensemble model forecasts: {json.dumps(forecast_map)}
 OUTPUT ONLY JSON:
 {{"prediction_in_decimal": 0.75}}
 """))
-        critic_out = await structure_output(
-            sanitize_llm_json(critique), BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        raw_p = float(critic_out.prediction_in_decimal)
-
-        red_teamed_p = await self._red_team_forecast(question, research, raw_p)
+            critic_out = await structure_output(
+                sanitize_llm_json(critique), BinaryPrediction,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+            raw_p = float(critic_out.prediction_in_decimal)
+            red_teamed_p = await self._red_team_forecast(question, research, raw_p)
         # Use weighted ensemble median across all opinions
         all_probs    = model_probs + [raw_p, red_teamed_p]
         median_all_p = self._weighted_ensemble_median(model_probs) * 0.6 + \
@@ -2086,32 +2014,11 @@ OUTPUT ONLY JSON:
         if community is not None:
             applied.append(f"community-blend(c={float(community):.3f})")
 
-        tournament_slug = get_question_tournament_slug(question) or "unknown"
-        is_minibench    = is_minibench_question(question)
-
         if self.flags.enable_extremize:
             p_before_ext = blended_p
-            if is_minibench:
-                evidence_supports = self._evidence_supports_forecast(
-                    research, p_before_ext, question.question_text
-                )
-                if evidence_supports:
-                    p_ext = extremize_minibench(p_before_ext)
-                    applied.append("extremize(minibench)")
-                    logger.info(
-                        f"Minibench extremize: evidence=TRUE "
-                        f"{p_before_ext:.3f} → {p_ext:.3f}"
-                    )
-                else:
-                    p_ext = p_before_ext
-                    applied.append("no-extremize(no-evidence-support)")
-            else:
-                p_ext = extremize(p_before_ext, strength=0.3)
-                applied.append("extremize(0.3)")
-            logger.info(
-                f"Extremized: {p_before_ext:.3f} → {p_ext:.3f} "
-                f"(tournament={tournament_slug})"
-            )
+            p_ext = extremize(p_before_ext, strength=0.3)
+            applied.append("extremize(0.3)")
+            logger.info(f"Extremized: {p_before_ext:.3f} → {p_ext:.3f}")
         else:
             p_ext = blended_p
 
@@ -2131,7 +2038,7 @@ OUTPUT ONLY JSON:
             p_cal = p_time
 
         # FIX #4: removed the force-extreme 1%/99% cliff.
-        # Standard clipping for both minibench and non-minibench.
+        # Standard clipping.
         final_p = float(np.clip(p_cal, 0.03, 0.97))
         applied.append("clip(3%-97%)")
         self._record_prediction(question, final_p)
@@ -2238,34 +2145,17 @@ OUTPUT ONLY VALID JSON:
             {"option_name": name, "probability": float(current.get(name, 0.0))}
             for name in option_names
         ]
-        tournament_slug  = get_question_tournament_slug(question) or "unknown"
-        is_minibench     = is_minibench_question(question)
         is_parent_child  = (
             getattr(question, "parent_question", None) is not None
             or getattr(question, "child_questions", None) is not None
         )
 
-        if self.flags.enable_extremize and (is_parent_child or not is_minibench):
-            if is_minibench and is_parent_child:
-                avg_p = float(np.mean([o["probability"] for o in aligned])) if aligned else 0.5
-                if self._evidence_supports_forecast(research, avg_p, question.question_text):
-                    for o in aligned:
-                        pb = float(o["probability"])
-                        pa = extremize_minibench(pb)
-                        logger.info(f"Extremized (minibench PC): {pb:.3f} → {pa:.3f}")
-                        o["probability"] = pa
-            elif is_parent_child and not is_minibench:
-                for o in aligned:
-                    pb = float(o["probability"])
-                    pa = extremize(pb, strength=0.3)
-                    logger.info(f"Extremized (PC): {pb:.3f} → {pa:.3f} (tournament={tournament_slug})")
-                    o["probability"] = pa
-            elif not is_minibench:
-                for o in aligned:
-                    pb = float(o["probability"])
-                    pa = extremize(pb, strength=0.3)
-                    logger.info(f"Extremized: {pb:.3f} → {pa:.3f} (tournament={tournament_slug})")
-                    o["probability"] = pa
+        if self.flags.enable_extremize and (is_parent_child or aligned):
+            for o in aligned:
+                pb = float(o["probability"])
+                pa = extremize(pb, strength=0.3)
+                logger.info(f"Extremized multiple-choice: {pb:.3f} → {pa:.3f}")
+                o["probability"] = pa
 
         total = float(sum(o["probability"] for o in aligned))
         if total <= 0:
@@ -2410,8 +2300,6 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["tournament", "metaculus_cup", "test_questions"], default="tournament")
     parser.add_argument("--bot-name",            type=str, default="botduke")
     parser.add_argument("--no-extremize",        action="store_true")
-    parser.add_argument("--minibench-biweekly",  action="store_true",
-                        help="Tuned profile for topping the biweekly minibench: higher research effort, tighter calibration, memory-weighted.")
     parser.add_argument("--no-decomposition",    action="store_true")
     parser.add_argument("--no-meta-forecast",    action="store_true")
     parser.add_argument("--no-numeric-regimes",  action="store_true")
@@ -2443,12 +2331,11 @@ if __name__ == "__main__":
 
     async def run_all():
         if run_mode == "tournament":
-            seasonal, minibench, market_pulse = await asyncio.gather(
-                bot.forecast_on_tournament(CURRENT_AI_COMPETITION_ID,      return_exceptions=True),
-                bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID,    return_exceptions=True),
-                bot.forecast_on_tournament("market-pulse-26q3",            return_exceptions=True),
+            seasonal, market_pulse = await asyncio.gather(
+                bot.forecast_on_tournament(CURRENT_AI_COMPETITION_ID, return_exceptions=True),
+                bot.forecast_on_tournament("market-pulse-26q3",       return_exceptions=True),
             )
-            return seasonal + minibench + market_pulse
+            return seasonal + market_pulse
 
         if run_mode == "metaculus_cup":
             bot.skip_previously_forecasted_questions = False

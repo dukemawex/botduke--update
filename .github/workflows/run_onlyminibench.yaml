@@ -1,0 +1,47 @@
+name: OracleDeckv1 MiniBench only
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/20 * * * *"
+
+concurrency:
+  group: oracledeckv1-minibench
+  cancel-in-progress: false
+
+jobs:
+  minibench_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: Install runtime extras
+        run: poetry run pip install cognee aiohttp
+      - name: Run MiniBench-only bot
+        run: poetry run python onlyminibench.py --bot-name oracledeckv1
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_CLIENT_SECRET: ${{ secrets.ASKNEWS_CLIENT_SECRET }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          NIMBLE_API_KEY: ${{ secrets.NIMBLE_API_KEY }}
+          YOUCOM_API_KEY: ${{ secrets.YOUCOM_API_KEY }}
+          USE_COGNEE: "1"
+          COGNEE_LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FORECAST_MEMORY_PATH: "forecast_memory.jsonl"

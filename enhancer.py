@@ -112,7 +112,12 @@ class ForecastingEnhancer:
             directional_bias=float(min(1.0, max(-1.0, direction))),
         )
 
-    async def synthesize_research(self, question_text: str, aggregated_research: str) -> ResearchSynthesis:
+    async def synthesize_research(
+        self,
+        question_text: str,
+        aggregated_research: str,
+        model_name: Optional[str] = None,
+    ) -> ResearchSynthesis:
         prompt = clean_indents(f"""
 You are GPT-5.5 Online acting as a research synthesizer for forecasting.
 Synthesize all research sources and estimate directional confidence consistency.
@@ -136,9 +141,13 @@ Rules:
 - Do not include markdown/code fences.
 """)
 
-        for model_name in ("openrouter/openai/gpt-5.6-luna", "openrouter/deepseek/deepseek-v4-pro"):  # cheap top-tier
+        models = [model_name] if model_name else (
+            "openrouter/openai/gpt-5.6-luna",
+            "openrouter/deepseek/deepseek-v4-pro",
+        )
+        for synthesis_model in models:
             try:
-                llm = GeneralLlm(model=model_name, temperature=0)
+                llm = GeneralLlm(model=synthesis_model, temperature=0)
                 raw = await llm.invoke(prompt)
                 data = json.loads(self._sanitize_json(raw))
                 summary = str(data.get("context_summary", "")).strip()
@@ -152,7 +161,7 @@ Rules:
                         directional_bias=bias,
                     )
             except Exception as e:
-                logger.warning(f"Research synthesis failed for {model_name}: {e}")
+                logger.warning(f"Research synthesis failed for {synthesis_model}: {e}")
         return self._heuristic_synthesis(aggregated_research)
 
     def median_probability(self, probabilities: Iterable[float]) -> float:
