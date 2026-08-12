@@ -499,6 +499,9 @@ class NumericRegime(str, Enum):
 @dataclass
 class BotFeatureFlags:
     enable_extremize:          bool = True
+    # Optional fixed roster for controlled experiments. A one-item roster
+    # bypasses critic/red-team voting and uses that model's forecast directly.
+    forecast_model_names:      Optional[tuple[str, ...]] = None
     enable_decomposition:      bool = True
     enable_meta_forecast:      bool = True
     enable_numeric_regimes:    bool = True
@@ -1109,8 +1112,7 @@ Fine print:
         synthesis = await self.enhancer.synthesize_research(
             question.question_text,
             combined,
-            # If ForecastingEnhancer accepts a model kwarg, pass it here:
-            # model=self.get_synthesis_model(),
+            model_name=self.get_synthesis_model(),
         )
         combined = (
             f"{combined}\n\n"
@@ -1922,23 +1924,29 @@ Percentile 90: XX
     ) -> ReasonedPrediction[float]:
         self._ensure_some_research_or_raise(research)
 
-        # FIX: use global _FORECAST_ENSEMBLE so gpt-5.1 (highest weight) is always present.
-        # Perplexity sonar-pro is the 5th model, adding live-web context to the vote.
-        results = await self._collect_model_forecasts(_FORECAST_ENSEMBLE, question, research)
+        model_names = list(self.flags.forecast_model_names or _FORECAST_ENSEMBLE)
+        # A one-model run is intentional: it is a clean FutureSearch-style
+        # research + forecaster path, not a disguised ensemble with duplicate
+        # critic/red-team opinions.
+        results = await self._collect_model_forecasts(model_names, question, research)
         if not results:
             raise RuntimeError("No model forecasts available for binary prediction.")
 
         model_probs = [float(r.prediction_in_decimal) for r in results]
 
-        # FIX: use weighted median — gpt-5.1 carries 0.30 weight
         model_weighted = self._weighted_ensemble_median(model_probs)
+        single_model = len(model_probs) == 1
 
         forecast_map           = {f"model_{i}": p for i, p in enumerate(model_probs)}
         forecast_map["model_weighted"] = model_weighted
         spread = max(model_probs) - min(model_probs) if len(model_probs) > 1 else 0.0
 
-        critic_llm = self.get_llm("critic", "llm")
-        critique   = await critic_llm.invoke(clean_indents(f"""
+        if single_model:
+            raw_p = model_probs[0]
+            red_teamed_p = raw_p
+        else:
+            critic_llm = self.get_llm("critic", "llm")
+            critique = await critic_llm.invoke(clean_indents(f"""
 You are a conservative critic reviewing an ensemble forecast.
 Question: {question.question_text}
 Research:
@@ -1951,14 +1959,13 @@ Ensemble model forecasts: {json.dumps(forecast_map)}
 OUTPUT ONLY JSON:
 {{"prediction_in_decimal": 0.75}}
 """))
-        critic_out = await structure_output(
-            sanitize_llm_json(critique), BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        raw_p = float(critic_out.prediction_in_decimal)
-
-        red_teamed_p = await self._red_team_forecast(question, research, raw_p)
+            critic_out = await structure_output(
+                sanitize_llm_json(critique), BinaryPrediction,
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+            raw_p = float(critic_out.prediction_in_decimal)
+            red_teamed_p = await self._red_team_forecast(question, research, raw_p)
         # Use weighted ensemble median across all opinions
         all_probs    = model_probs + [raw_p, red_teamed_p]
         median_all_p = self._weighted_ensemble_median(model_probs) * 0.6 + \

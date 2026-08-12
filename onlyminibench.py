@@ -16,6 +16,22 @@ from forecasting_tools import MetaculusClient
 from main import BotFeatureFlags, SpringAdvancedForecastingBot
 
 
+class SingleModelMiniBenchBot(SpringAdvancedForecastingBot):
+    def __init__(self, *args, single_model: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.single_model = single_model
+
+    def _llm_config_defaults(self):
+        model = self.single_model
+        return {role: model for role in (
+            "default", "parser", "summarizer", "researcher",
+            "query_optimizer", "critic", "red_team", "decomposer",
+        )}
+
+    def get_synthesis_model(self):
+        return self.single_model
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -24,6 +40,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run OracleDeckv1 on MiniBench only")
     parser.add_argument("--bot-name", type=str, default="oracledeckv1")
+    parser.add_argument("--model", type=str, default="openrouter/openai/gpt-5.6-luna",
+                        help="One model used for research synthesis and forecasting")
     parser.add_argument("--no-decomposition", action="store_true")
     parser.add_argument("--no-meta-forecast", action="store_true")
     parser.add_argument("--no-numeric-regimes", action="store_true")
@@ -34,13 +52,15 @@ if __name__ == "__main__":
         # Do not apply the generic extremization curve to MiniBench until it is
         # validated on a complete resolved round.
         enable_extremize=False,
+        forecast_model_names=(args.model,),
         enable_decomposition=not args.no_decomposition,
         enable_meta_forecast=not args.no_meta_forecast,
         enable_numeric_regimes=not args.no_numeric_regimes,
         enable_detailed_reasoning=not args.no_detailed_reasoning,
     )
 
-    bot = SpringAdvancedForecastingBot(
+    bot = SingleModelMiniBenchBot(
+        single_model=args.model,
         research_reports_per_question=1,
         predictions_per_research_report=1,
         use_research_summary_to_forecast=False,
