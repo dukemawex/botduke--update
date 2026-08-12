@@ -40,17 +40,32 @@ def make_queries(question: str, as_of: str) -> list[str]:
     return qs or [question]
 
 
+# main.py maps "number of sources that returned content" onto this ladder.
+# The harness reuses it so legacy() sees the same quality scale it sees live,
+# otherwise the A/B silently disables legacy's weak-research shrink.
+_QUALITY_LADDER = {0: 0.40, 1: 0.50, 2: 0.65, 3: 0.78, 4: 0.85, 5: 0.90, 6: 0.93}
+
+
+def _domain(url: str) -> str:
+    u = (url or "").split("//")[-1]
+    return u.split("/")[0].lower().removeprefix("www.")
+
+
 def research(question: str, as_of: str) -> tuple[str, float]:
-    blocks, hits = [], 0
+    blocks, domains = [], set()
     for q in make_queries(question, as_of):
         for item in nimble(q, as_of):
             title = (item.get("title") or "").strip()
             desc = (item.get("description") or item.get("content") or "").strip()
-            if title or desc:
-                hits += 1
-                blocks.append(f"- {title}: {desc[:400]}")
+            if not (title or desc):
+                continue
+            blocks.append(f"- {title}: {desc[:400]}")
+            d = _domain(item.get("url") or "")
+            domains.add(d or title[:24].lower())
     text = "\n".join(blocks[:18])
-    quality = min(hits / 12.0, 1.0)   # 12+ usable snippets == full confidence
+    # Count distinct sources, not raw snippet volume. Snippet count saturates
+    # at 18 on every question and makes the quality signal constant.
+    quality = _QUALITY_LADDER.get(min(len(domains), 6), 0.93)
     return text, round(quality, 3)
 
 
@@ -118,7 +133,7 @@ def main() -> None:
     ap.add_argument("--corpus", default="eval/corpus.jsonl")
     ap.add_argument("--out", default="eval/stage1.jsonl")
     ap.add_argument("--lead-days", type=int, default=30)
-    ap.add_argument("--members", type=int, default=5)
+    ap.add_argument("--members", type=int, default=3)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0)
     a = ap.parse_args()

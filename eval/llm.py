@@ -16,9 +16,28 @@ not care which one is behind it. Keep the provider fixed within a single sweep;
 comparing configs across providers measures the provider, not the config.
 """
 from __future__ import annotations
-import os, re, json
+import os, re, json, threading, time
 from typing import Optional
 import requests
+
+_RPM = int(os.environ.get("LLM_RPM", "0"))          # 0 = unlimited
+_lock = threading.Lock()
+_calls: list[float] = []
+
+
+def _throttle() -> None:
+    """Global requests-per-minute gate. OpenRouter free models cap at 20/min."""
+    if _RPM <= 0:
+        return
+    while True:
+        with _lock:
+            now = time.time()
+            _calls[:] = [t for t in _calls if now - t < 60.0]
+            if len(_calls) < _RPM:
+                _calls.append(now)
+                return
+            wait = 60.0 - (now - _calls[0]) + 0.05
+        time.sleep(max(wait, 0.1))
 
 DEFAULT_BASE = "https://emmanuelduke243689-6684-resource.services.ai.azure.com/openai/v1"
 DEFAULT_DEPLOYMENT = "gpt-5.6-sol"
@@ -52,12 +71,30 @@ def complete(prompt: str, temperature: float = 0.3, max_tokens: int = 1200,
     msgs = ([{"role": "system", "content": system}] if system else []) + \
            [{"role": "user", "content": prompt}]
 
-    r = requests.post(f"{base}/chat/completions", headers=headers, timeout=180, json={
-        "model": dep, "messages": msgs,
-        "temperature": temperature, "max_completion_tokens": max_tokens,
-    })
-    if r.status_code == 200:
-        return (r.json()["choices"][0]["message"]["content"] or "").strip()
+    is_or = "openrouter" in base
+    body = {"model": dep, "messages": msgs, "temperature": temperature}
+    body["max_tokens" if is_or else "max_completion_tokens"] = max_tokens
+
+    for attempt in range(4):
+        _throttle()
+        r = requests.post(f"{base}/chat/completions", headers=headers, timeout=180, json=body)
+        if r.status_code == 200:
+            d = r.json()
+            choices = d.get("choices") or []
+            if choices:
+                return (choices[0].get("message", {}).get("content") or "").strip()
+            # OpenRouter can return 200 with an error body or an empty completion
+            err = (d.get("error") or {}).get("message", "")
+            if "rate" in err.lower() or "429" in err:
+                time.sleep(20 * (attempt + 1))
+                continue
+            raise RuntimeError(f"no choices in 200 response: {json.dumps(d)[:200]}")
+        if r.status_code == 429:
+            time.sleep(20 * (attempt + 1))
+            continue
+        break
+    if is_or:
+        raise RuntimeError(f"openrouter {r.status_code}: {r.text[:200]}")
 
     r2 = requests.post(f"{base}/responses", headers=headers, timeout=180, json={
         "model": dep,
