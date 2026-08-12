@@ -578,6 +578,9 @@ class NumericRegime(str, Enum):
 @dataclass
 class BotFeatureFlags:
     enable_extremize:          bool = True
+    # MiniBench is a separate product: short, machine-generated questions
+    # reward fast, well-grounded calls; do not reuse seasonal post-processing.
+    minibench_profile:         bool = False
     enable_decomposition:      bool = True
     enable_meta_forecast:      bool = True
     enable_numeric_regimes:    bool = True
@@ -2096,10 +2099,17 @@ OUTPUT ONLY JSON:
                     research, p_before_ext, question.question_text
                 )
                 if evidence_supports:
-                    p_ext = extremize_minibench(p_before_ext)
-                    applied.append("extremize(minibench)")
+                    # Profile is deliberately conservative until a fixed-model
+                    # MiniBench replay proves an extremization gain. The old
+                    # curve was tuned by hand and the live rank says it failed.
+                    if self.flags.minibench_profile:
+                        p_ext = float(np.clip(p_before_ext, 0.03, 0.97))
+                        applied.append("minibench-profile(no-extremize)")
+                    else:
+                        p_ext = extremize_minibench(p_before_ext)
+                        applied.append("extremize(minibench)")
                     logger.info(
-                        f"Minibench extremize: evidence=TRUE "
+                        f"MiniBench policy: evidence=TRUE "
                         f"{p_before_ext:.3f} → {p_ext:.3f}"
                     )
                 else:
@@ -2422,6 +2432,7 @@ if __name__ == "__main__":
 
     flags = BotFeatureFlags(
         enable_extremize          = not args.no_extremize,
+        minibench_profile         = args.minibench_biweekly,
         enable_decomposition      = not args.no_decomposition,
         enable_meta_forecast      = not args.no_meta_forecast,
         enable_numeric_regimes    = not args.no_numeric_regimes,

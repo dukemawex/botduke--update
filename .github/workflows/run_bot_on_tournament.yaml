@@ -3,7 +3,7 @@ name: Forecast on new AI tournament questions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *" # runs every 20 minutes. Make sure to skip already forecasted questions!
+    - cron: "*/20 * * * *" # every 20 minutes; skip already forecasted questions
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -41,7 +41,7 @@ jobs:
         run: poetry run pip install cognee aiohttp
       - name: Run bot
         run: |
-          poetry run python main.py
+          poetry run python main.py --minibench-biweekly
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
