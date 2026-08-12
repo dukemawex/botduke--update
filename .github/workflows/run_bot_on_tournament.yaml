@@ -41,7 +41,7 @@ jobs:
         run: poetry run pip install cognee aiohttp
       - name: Run bot
         run: |
-          poetry run python main.py --bot-name oracledeckv1 --minibench-biweekly
+          poetry run python main.py --bot-name oracledeckv1
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
