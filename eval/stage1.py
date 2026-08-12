@@ -35,7 +35,7 @@ def make_queries(question: str, as_of: str) -> list[str]:
         f"Today is {as_of}. Turn this forecasting question into 3 web search "
         f"queries that would surface the relevant evidence as of that date. "
         f"Return only the 3 queries, one per line, no numbering.\n\n{question}",
-        temperature=0.2, max_tokens=200)
+        temperature=0.2, max_tokens=700)
     qs = [l.strip(" -•\t") for l in (out or "").splitlines() if l.strip()][:3]
     return qs or [question]
 
@@ -104,15 +104,18 @@ def forecast_one(row: dict, lead_days: int, members: int) -> dict | None:
         prompt = PROMPT.format(as_of=as_of, title=row["title"],
                                criteria=(row.get("resolution_criteria") or "")[:1500],
                                research=res_text or "(no usable results)")
-        probs = []
-        for i in range(members):
+        def one_member(i: int):
             try:
-                p = extract_probability(complete(prompt, temperature=0.2 + 0.2 * i))
+                return extract_probability(
+                    complete(prompt, temperature=0.2 + 0.2 * i, max_tokens=2500))
             except Exception as e:
                 print(f"  member fail {row['id']}: {e}", file=sys.stderr)
-                p = None
-            if p is not None:
-                probs.append(p)
+                return None
+
+        # Ensemble members are independent; running them sequentially made each
+        # question cost members x latency for no reason.
+        with ThreadPoolExecutor(max_workers=members) as mex:
+            probs = [p for p in mex.map(one_member, range(members)) if p is not None]
         if not probs:
             return None
     except Exception as e:

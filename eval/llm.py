@@ -82,7 +82,20 @@ def complete(prompt: str, temperature: float = 0.3, max_tokens: int = 1200,
             d = r.json()
             choices = d.get("choices") or []
             if choices:
-                return (choices[0].get("message", {}).get("content") or "").strip()
+                msg = choices[0].get("message", {}) or {}
+                text = (msg.get("content") or "").strip()
+                if text:
+                    return text
+                # Reasoning models spend the token budget on `reasoning` and can
+                # return empty content. The answer is usually still in there.
+                reasoning = (msg.get("reasoning") or "").strip()
+                if reasoning:
+                    return reasoning
+                if attempt < 3:
+                    body["max_tokens" if is_or else "max_completion_tokens"] = \
+                        min(int(body.get("max_tokens") or body.get("max_completion_tokens") or 1200) * 2, 8000)
+                    continue
+                return ""
             # OpenRouter can return 200 with an error body or an empty completion
             err = (d.get("error") or {}).get("message", "")
             if "rate" in err.lower() or "429" in err:
