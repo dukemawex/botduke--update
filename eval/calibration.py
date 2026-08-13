@@ -25,6 +25,8 @@ def sigmoid(x: float) -> float:
 
 
 def extremize(p: float, strength: float = 0.3) -> float:
+    # Models can emit exactly 0% or 100%; keep odds finite before extremizing.
+    p = min(max(p, 1e-6), 1 - 1e-6)
     o = p / (1 - p)
     e = o ** (1 + strength)
     return min(max(e / (1 + e), 0.01), 0.99)

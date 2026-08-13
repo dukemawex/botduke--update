@@ -117,3 +117,22 @@ def summarize(
         baseline_relative=rel,
         calibration_error=calibration_error(pairs),
     )
+
+
+def bootstrap_metric_delta(values: Sequence[float], n_boot: int = 10000,
+                           seed: int = 0) -> dict:
+    """Paired bootstrap CI for a per-question metric difference."""
+    if not values:
+        return {"mean": 0.0, "ci95_low": 0.0, "ci95_high": 0.0}
+    rng = __import__("random").Random(seed)
+    n = len(values)
+    means = []
+    for _ in range(n_boot):
+        total = 0.0
+        for _ in range(n):
+            total += values[rng.randrange(n)]
+        means.append(total / n)
+    means.sort()
+    lo = means[int(0.025 * (n_boot - 1))]
+    hi = means[int(0.975 * (n_boot - 1))]
+    return {"mean": sum(values) / n, "ci95_low": lo, "ci95_high": hi}
