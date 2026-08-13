@@ -45,7 +45,7 @@ DEFAULT_DEPLOYMENT = "gpt-5.6-sol"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_OR_MODEL = "openai/gpt-5.6-luna"
 AKASHML_BASE = "https://api.akashml.com/v1"
-DEFAULT_AKASH_MODEL = "openai/gpt-oss-120b"
+DEFAULT_AKASH_MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
 
 
 def _cfg() -> tuple[str, str, str]:
