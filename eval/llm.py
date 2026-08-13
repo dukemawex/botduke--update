@@ -10,6 +10,7 @@ Provider is switchable so the harness is not hostage to one account:
 
     LLM_PROVIDER=azure       AZURE_API_KEY, AZURE_BASE_URL, AZURE_DEPLOYMENT
     LLM_PROVIDER=openrouter  OPENROUTER_API_KEY, OPENROUTER_MODEL
+    LLM_PROVIDER=akashml    AKASHML_API_KEY, AKASHML_MODEL
 
 Both speak the same OpenAI-compatible chat/completions shape, so stage 1 does
 not care which one is behind it. Keep the provider fixed within a single sweep;
@@ -43,6 +44,8 @@ DEFAULT_BASE = "https://emmanuelduke243689-6684-resource.services.ai.azure.com/o
 DEFAULT_DEPLOYMENT = "gpt-5.6-sol"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_OR_MODEL = "openai/gpt-5.6-luna"
+AKASHML_BASE = "https://api.akashml.com/v1"
+DEFAULT_AKASH_MODEL = "openai/gpt-oss-120b"
 
 
 def _cfg() -> tuple[str, str, str]:
@@ -54,6 +57,13 @@ def _cfg() -> tuple[str, str, str]:
         return (key,
                 os.environ.get("OPENROUTER_BASE_URL", OPENROUTER_BASE).rstrip("/"),
                 os.environ.get("OPENROUTER_MODEL", DEFAULT_OR_MODEL))
+    if provider in ("akashml", "akash"):
+        key = os.environ.get("AKASHML_API_KEY")
+        if not key:
+            raise RuntimeError("LLM_PROVIDER=akashml but AKASHML_API_KEY not set")
+        return (key,
+                os.environ.get("AKASHML_BASE_URL", AKASHML_BASE).rstrip("/"),
+                os.environ.get("AKASHML_MODEL", DEFAULT_AKASH_MODEL))
     key = os.environ.get("AZURE_API_KEY")
     if not key:
         raise RuntimeError("AZURE_API_KEY not set (or set LLM_PROVIDER=openrouter)")
@@ -72,8 +82,9 @@ def complete(prompt: str, temperature: float = 0.3, max_tokens: int = 1200,
            [{"role": "user", "content": prompt}]
 
     is_or = "openrouter" in base
+    is_akash = "akashml.com" in base
     body = {"model": dep, "messages": msgs, "temperature": temperature}
-    body["max_tokens" if is_or else "max_completion_tokens"] = max_tokens
+    body["max_tokens" if (is_or or is_akash) else "max_completion_tokens"] = max_tokens
 
     for attempt in range(4):
         _throttle()
@@ -106,8 +117,9 @@ def complete(prompt: str, temperature: float = 0.3, max_tokens: int = 1200,
             time.sleep(20 * (attempt + 1))
             continue
         break
-    if is_or:
-        raise RuntimeError(f"openrouter {r.status_code}: {r.text[:200]}")
+    if is_or or is_akash:
+        provider_name = "openrouter" if is_or else "akashml"
+        raise RuntimeError(f"{provider_name} {r.status_code}: {r.text[:200]}")
 
     r2 = requests.post(f"{base}/responses", headers=headers, timeout=180, json={
         "model": dep,

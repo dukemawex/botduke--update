@@ -8,7 +8,7 @@ Research + the LLM ensemble is the only expensive part. It runs **once** per
 question and is cached. Calibration then reads the cache, so sweeping hundreds
 of aggregation configs costs zero tokens.
 
-    stage 1  research + ensemble  -> stage1.jsonl   (Azure credits go here)
+    stage 1  research + ensemble  -> stage1.jsonl   (provider credits go here)
     stage 2  calibration + score  -> free, unlimited
 
 ## Files
@@ -36,6 +36,7 @@ of aggregation configs costs zero tokens.
 ## Usage
 
     export METACULUS_TOKEN=...
+    # AkashML option: LLM_PROVIDER=akashml AKASHML_MODEL=openai/gpt-oss-120b
     python eval/fetch_corpus.py --months 18 --limit 900 --workers 3
     python eval/replay.py compare --stage1 eval/stage1.jsonl
     python eval/replay.py sweep   --stage1 eval/stage1.jsonl
