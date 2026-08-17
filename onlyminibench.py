@@ -19,8 +19,8 @@ from main import BotFeatureFlags, SpringAdvancedForecastingBot
 
 class SingleModelMiniBenchBot(SpringAdvancedForecastingBot):
     def __init__(self, *args, single_model: str, **kwargs):
-        super().__init__(*args, **kwargs)
         self.single_model = single_model
+        super().__init__(*args, **kwargs)
 
     def _llm_config_defaults(self):
         model = self.single_model
